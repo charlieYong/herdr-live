@@ -117,6 +117,9 @@ function list() {
 }
 
 // kill：关一个 agent 的 tab（收资源）并清台账。killAll 关全部。
+// 关键：只有确认关闭成功（或 tab/pane 本就不存在）才从台账删条目。关闭失败时保留
+// 台账条目，让后续 kill --all 能重试回收——否则条目丢了、tab 却残留，资源永久泄漏
+// 且无法二次回收（首版 bug）。
 function kill(name) {
   const entry = ledger.get(name);
   if (!entry) throw new herdrMod.HerdrError(`台账里没有 agent：${name}`);
@@ -126,16 +129,24 @@ function kill(name) {
     : entry.pane_id
       ? { kind: 'pane', id: entry.pane_id }
       : null;
+  // 无 target（从未拿到 pane/tab id）视为无可关资源，直接清台账。
+  let reclaimed = !target;
   if (target) {
     try {
-      herdr([target.kind, 'close', target.id]);
+      // 经 herdrMod 调用（而非解构的 herdr）以便自测可注入 stub。
+      herdrMod.herdr([target.kind, 'close', target.id]);
+      reclaimed = true;
     } catch (e) {
       const msg = String(e.message || e);
-      if (!/tab_not_found|pane_not_found/.test(msg)) errors.push(msg);
+      if (/tab_not_found|pane_not_found/.test(msg)) {
+        reclaimed = true; // 已经不存在，等价于已回收
+      } else {
+        errors.push(msg); // 瞬时/未知错误：保留台账条目以便重试
+      }
     }
   }
-  ledger.remove(name);
-  return { name, closed: errors.length === 0, target, errors };
+  if (reclaimed) ledger.remove(name);
+  return { name, closed: reclaimed && errors.length === 0, reclaimed, target, errors };
 }
 
 function killAll() {

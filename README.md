@@ -38,6 +38,8 @@ herdr-live wait <name> [--until <s>[,<s>]] [--timeout-ms <n>] [--poll-ms <n>]
 
 herdr-live list                 # 本工具起过的 live agents + herdr 实时状态
 herdr-live kill <name> | --all  # 关 tab 收资源,清台账
+    # 只有确认关闭成功(或 tab 本就不存在)才删台账条目;关闭失败保留条目,
+    # 以便 kill --all 重试回收——避免条目丢失后 tab 残留、资源无法二次回收。
 ```
 
 ## 内建知识(把踩过的坑固化进工具)

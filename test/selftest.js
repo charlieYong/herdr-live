@@ -112,6 +112,50 @@ check('台账 get 不存在返回 null', () => {
   assert.strictEqual(ledger.get('nope'), null);
 });
 
+// --- kill 语义：关闭失败保留台账条目（首版泄漏 bug 的回归） ---
+const herdrMod = require('../src/herdr');
+const live = require('../src/live');
+const realHerdr = herdrMod.herdr;
+
+check('kill 关闭失败时保留台账条目（可重试回收）', () => {
+  ledger.put('killFail', { pane_id: 'w1:p9', tab_id: 'w1:t9', kind: 'cursor', model: 'm', cwd: '/c' });
+  herdrMod.herdr = () => { throw new herdrMod.HerdrError('transient: server busy'); };
+  try {
+    const res = live.kill('killFail');
+    assert.strictEqual(res.reclaimed, false, 'reclaimed 应为 false');
+    assert.strictEqual(res.closed, false, 'closed 应为 false');
+    assert.ok(res.errors.length > 0, '应记录错误');
+    assert.ok(ledger.get('killFail'), '台账条目必须保留以便重试');
+  } finally {
+    herdrMod.herdr = realHerdr;
+  }
+});
+
+check('kill 关闭成功时删除台账条目', () => {
+  ledger.put('killOk', { pane_id: 'w1:p8', tab_id: 'w1:t8', kind: 'cursor', model: 'm', cwd: '/c' });
+  herdrMod.herdr = () => 'ok';
+  try {
+    const res = live.kill('killOk');
+    assert.strictEqual(res.reclaimed, true);
+    assert.strictEqual(res.closed, true);
+    assert.strictEqual(ledger.get('killOk'), null, '成功后台账条目应删除');
+  } finally {
+    herdrMod.herdr = realHerdr;
+  }
+});
+
+check('kill tab 已不存在视为已回收并清台账', () => {
+  ledger.put('killGone', { pane_id: 'w1:p7', tab_id: 'w1:t7', kind: 'cursor', model: 'm', cwd: '/c' });
+  herdrMod.herdr = () => { throw new herdrMod.HerdrError('tab_not_found: w1:t7'); };
+  try {
+    const res = live.kill('killGone');
+    assert.strictEqual(res.reclaimed, true, 'not_found 等价已回收');
+    assert.strictEqual(ledger.get('killGone'), null);
+  } finally {
+    herdrMod.herdr = realHerdr;
+  }
+});
+
 // 清理临时台账
 try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch (e) { /* ignore */ }
 
