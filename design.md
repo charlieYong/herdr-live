@@ -1,7 +1,7 @@
 # 设计:herdr-live — 通用多 agent live 编排工具
 
 > 把 herdr 底层能力(扣起 N 个真 agent、发 prompt、读输出/状态)封装成**跨项目可复用**的工具。
-> 本文记录**设计动机、边界与落地历程**;用法/坑清单见同工程 [`../README.md`](../README.md)。
+> 本文记录**设计动机、边界与落地历程**;用法/坑清单见 [`README.md`](./README.md),典型使用场景见 [`scenarios.md`](./scenarios.md)。
 > 缘起于 agent2agent 的双 harness spike(见其 ADR-0010),但工具本身独立、通用,agent2agent 只是第一个消费者。
 > **现状**:已按本设计落地为 Node CLI(五动词 spawn/prompt/read/wait/kill + scene),确定性自测与真 agent happy-path 均通过。
 
