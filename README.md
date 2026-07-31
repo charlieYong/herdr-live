@@ -4,7 +4,7 @@
 是 herdr 底层 CLI(`tab create` / `agent start` / `agent prompt` / `agent read` / `tab close`)
 的一层薄封装,把易错的底层序列变成语义明确的五个动词。
 
-> 设计方案与定位见 [`~/charlie/agent2agent/docs/05-herdr-live-toolkit.md`](../agent2agent/docs/05-herdr-live-toolkit.md)。
+> 设计动机、边界与落地历程见 [`docs/design.md`](./docs/design.md)。
 > **中性通用**:只做功能实现、封装与文档,不替调用者设领域约束("中继/不中继消息"
 > 是消费者如 agent2agent 的选择,不是本工具的限制)。
 
