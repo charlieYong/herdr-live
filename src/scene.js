@@ -8,8 +8,9 @@
 // scene.json 形态：
 // {
 //   "agents": [
-//     { "name": "a", "kind": "cursor", "model": "cursor-grok-4.5-high", "cwd": "/path",
-//       "prompt": "初始指令文本", "promptFile": "可选：从文件读 prompt",
+//     { "name": "a", "kind": "cursor", "cwd": "/path",
+//       "prompt": "短指令", "promptFile": "可选：整段 paste（小）",
+//       "briefFile": "可选：长说明书落盘→短指针（首选大内容）",
 //       "waitUntil": ["idle","done"], "timeoutMs": 300000 }
 //   ],
 //   "collect": [ { "agent": "a", "tail": 40 } ]   // 收集哪些 agent 的尾部输出
@@ -33,11 +34,14 @@ async function runScene(file) {
   for (const a of agents) {
     let text = a.prompt;
     if (a.promptFile) text = fs.readFileSync(a.promptFile, 'utf8');
-    if (text == null) continue;
+    if (text == null && !a.briefFile) continue;
     const res = await live.prompt(a.name, text, {
+      briefFile: a.briefFile,
       waitUntil: a.waitUntil,
       timeoutMs: a.timeoutMs,
       settleMs: a.settleMs,
+      confirmStartMs: a.confirmStartMs,
+      forcePaste: a.forcePaste,
     });
     prompted.push(res);
   }

@@ -32,11 +32,13 @@ test "${HERDR_ENV:-}" = 1
 ```bash
 HL="node ~/charlie/herdr-live/bin/herdr-live.js"
 
-$HL spawn <name> --kind <cursor|claude|codex> --model <m> [--cwd <dir>] [--label <l>]
-    # 起一个 live agent(tab create 拿 pane_id + agent start 按 kind 拼 executor flags)
+$HL spawn <name> --kind <cursor|claude|codex> [--model <m>] [--cwd <dir>] [--label <l>]
+    # --model 可省略（kinds 默认对齐 herdr-orchestrator）
 
-$HL prompt <name> --text <t> | --file <path> [--wait-until <s>[,<s>]] [--timeout-ms <n>] [--settle-ms <n>]
-    # 发 prompt 并自动提交(内建填充→settle→enter)
+$HL prompt <name> --brief-file <path> | --text <t> | --file <path>
+    [--wait-until <s>[,<s>]] [--timeout-ms <n>] [--settle-ms <n>] [--force-paste]
+    # 大内容用 --brief-file（短指针）；--file 仍是整段 paste（≠指针）
+    # 成功前确认 working|done|blocked；假 idle 会失败退出
 
 $HL read <name> [--tail <N>]        # 读 agent 对话输出
 $HL wait <name> [--until <s>[,<s>]] [--timeout-ms <n>]   # 轮询到目标状态(默认 idle,done)
@@ -47,11 +49,15 @@ $HL scene <scene.json>              # 声明式批量编排:spawn→prompt→col
 
 ## 必须知道的坑(否则会踩)
 
-- **prompt 提交竞态**:`prompt` 内部在填充与 enter 之间插了 ~1s settle 延时才稳定提交;
-  若自定义 `--settle-ms`,别设太小(<1s 偶发滞留、prompt 发不出)。
+- **大 prompt 用短指针**:说明书落盘后 `--brief-file`;不要整段 paste 多 KB 进输入框
+  （软上限 ~2KB）。`--file` ≠ `--brief-file`。
+- **不要信假 submitted**:旧行为可能返回 `{submitted:true, state:idle}` 而 prompt 仍在框里。
+  现已改为开工确认失败即非 0。编排者应看返回的 `confirmed`/`state`,或继续 `wait`。
+- **prompt 提交竞态**:settle 只是兜底(cursor/claude ~1s, codex ~2s);大内容优先 brief-file,
+  别靠把 `--settle-ms` 调到很大。
 - **read 不是权威源**:回滚窗口有限、长输出会滚掉。需要可靠回收产物时,让 agent **写文件**
   (或写到 Bus/外部 transcript),再去读文件,不要单靠 `read` 的终端输出。
-- **model slug**:cursor 用 `cursor-grok-4.5-high` 之类;claude 的 slug 与 cursor 不同,用前自校验。
+- **model slug**:缺省用 kinds 默认;覆盖前自校验(claude slug ≠ cursor slug)。
 
 ## 典型场景(何时想起用它)
 
@@ -62,3 +68,11 @@ $HL scene <scene.json>              # 声明式批量编排:spawn→prompt→col
 
 编排结束务必 `kill --all` 回收 tab;关闭失败会保留台账条目以便重试,可再次 `kill --all`。
 `list` 可查当前起过的 agent 与其 tab_id(供人切入某个 pane 时用)。
+
+## 验收(改工具后)
+
+```bash
+npm run selftest                      # L0
+node test/live-happy-path.js          # L1 单端
+node test/l2-dual-cursor-brief.js     # L2 双 cursor + brief-file
+```

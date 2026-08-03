@@ -27,7 +27,16 @@ const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-live-test-'));
 process.env.HERDR_LIVE_HOME = tmpHome;
 
 const { deepId, unwrap } = require('../src/herdr');
-const { adapterFlags, submitNeedsEnter, validateModel } = require('../src/kinds');
+const {
+  adapterFlags,
+  submitNeedsEnter,
+  validateModel,
+  resolveModel,
+  defaultSettleMs,
+  buildBriefPointer,
+  PASTE_SOFT_LIMIT_BYTES,
+  KINDS,
+} = require('../src/kinds');
 const ledger = require('../src/ledger');
 
 console.log('herdr-live 确定性自测');
@@ -84,6 +93,25 @@ check('submitNeedsEnter 默认 true', () => {
   assert.strictEqual(submitNeedsEnter('cursor'), true);
   assert.strictEqual(submitNeedsEnter('claude'), true);
   assert.strictEqual(submitNeedsEnter(undefined), true);
+});
+
+check('resolveModel：显式覆盖默认', () => {
+  assert.strictEqual(resolveModel('claude', 'my-claude'), 'my-claude');
+  assert.strictEqual(resolveModel('claude', undefined), KINDS.claude.defaultModel);
+  assert.strictEqual(resolveModel('codex', null), KINDS.codex.defaultModel);
+  assert.strictEqual(resolveModel('cursor', ''), KINDS.cursor.defaultModel);
+});
+
+check('defaultSettleMs：codex 默认更长', () => {
+  assert.strictEqual(defaultSettleMs('codex'), 2000);
+  assert.strictEqual(defaultSettleMs('cursor'), 1000);
+});
+
+check('buildBriefPointer：短指针含绝对路径', () => {
+  const p = buildBriefPointer('/tmp/brief.md', { cwd: '/work' });
+  assert.ok(p.includes('/tmp/brief.md'));
+  assert.ok(p.includes('工作目录：/work'));
+  assert.ok(Buffer.byteLength(p, 'utf8') < PASTE_SOFT_LIMIT_BYTES);
 });
 
 // --- 台账往返：put / get / all / remove ---
@@ -156,7 +184,108 @@ check('kill tab 已不存在视为已回收并清台账', () => {
   }
 });
 
-// 清理临时台账
-try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+check('assertPasteSize：超软上限拒绝', () => {
+  const big = 'x'.repeat(PASTE_SOFT_LIMIT_BYTES + 1);
+  assert.throws(() => live.assertPasteSize(big), /超过输入框软上限/);
+  assert.doesNotThrow(() => live.assertPasteSize(big, { forcePaste: true }));
+  assert.doesNotThrow(() => live.assertPasteSize('ok'));
+});
 
-console.log(`\n${process.exitCode ? 'SOME FAILED' : 'ALL PASS'} (${pass} checks)`);
+const realAgentRecord = herdrMod.agentRecord;
+const realAgentState = herdrMod.agentState;
+
+async function checkAsync(name, fn) {
+  try {
+    await fn();
+    pass++;
+    console.log(`  ok  ${name}`);
+  } catch (e) {
+    console.error(`FAIL  ${name}\n      ${e.message}`);
+    process.exitCode = 1;
+  }
+}
+
+(async () => {
+  await checkAsync('prompt：假 idle 抛错（非假 submitted）', async () => {
+    ledger.put('promptIdle', {
+      pane_id: 'w1:p1', tab_id: 'w1:t1', kind: 'cursor', model: 'm', cwd: '/c',
+    });
+    const calls = [];
+    herdrMod.herdr = (args) => {
+      calls.push(args);
+      return 'ok';
+    };
+    herdrMod.agentRecord = () => ({ name: 'promptIdle' });
+    herdrMod.agentState = () => 'idle';
+    try {
+      let threw = false;
+      try {
+        await live.prompt('promptIdle', 'hi', { confirmStartMs: 400, settleMs: 0 });
+      } catch (e) {
+        threw = true;
+        assert.ok(/未确认开工/.test(e.message), e.message);
+      }
+      assert.ok(threw, '应抛错，不得返回 submitted:true');
+      assert.ok(calls.some((a) => a[0] === 'agent' && a[1] === 'prompt'));
+      assert.ok(calls.some((a) => a[0] === 'agent' && a[1] === 'send-keys'));
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('prompt：见 working 则确认成功', async () => {
+    ledger.put('promptOk', {
+      pane_id: 'w1:p2', tab_id: 'w1:t2', kind: 'claude', model: 'm', cwd: '/work',
+    });
+    herdrMod.herdr = () => 'ok';
+    herdrMod.agentRecord = () => ({ name: 'promptOk' });
+    herdrMod.agentState = () => 'working';
+    try {
+      const res = await live.prompt('promptOk', 'hi', { confirmStartMs: 2000, settleMs: 0 });
+      assert.strictEqual(res.submitted, true);
+      assert.strictEqual(res.confirmed, true);
+      assert.strictEqual(res.state, 'working');
+      assert.strictEqual(res.transport, 'paste');
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('prompt：--brief-file 发短指针而非整文件', async () => {
+    const briefPath = path.join(tmpHome, 'big-brief.md');
+    fs.writeFileSync(briefPath, 'x'.repeat(5000));
+    ledger.put('promptBrief', {
+      pane_id: 'w1:p3', tab_id: 'w1:t3', kind: 'codex', model: 'm', cwd: '/work',
+    });
+    let promptedBody = null;
+    herdrMod.herdr = (args) => {
+      if (args[0] === 'agent' && args[1] === 'prompt') promptedBody = args[3];
+      return 'ok';
+    };
+    herdrMod.agentRecord = () => ({ name: 'promptBrief' });
+    herdrMod.agentState = () => 'working';
+    try {
+      const res = await live.prompt('promptBrief', null, {
+        briefFile: briefPath,
+        confirmStartMs: 2000,
+        settleMs: 0,
+      });
+      assert.strictEqual(res.transport, 'brief-pointer');
+      assert.ok(promptedBody.includes(briefPath));
+      assert.ok(!promptedBody.includes('xxxxx'), '不应整段 paste 大文件');
+      assert.ok(res.promptBytes < PASTE_SOFT_LIMIT_BYTES);
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  console.log(`\n${process.exitCode ? 'SOME FAILED' : 'ALL PASS'} (${pass} checks)`);
+})();
+

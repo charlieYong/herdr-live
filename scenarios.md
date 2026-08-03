@@ -65,6 +65,8 @@
 ## 通用注意(跨场景)
 
 - **前置**:必须在 Herdr pane 内(`HERDR_ENV=1`)。
-- **prompt 提交**:填充与 enter 间有竞态,默认 1s settle(见 README 坑清单)。
+- **大 prompt 用 `--brief-file`**:长说明书落盘后发短指针;不要整段 paste 多 KB
+  (`--file` ≠ `--brief-file`)。双端验收见 `node test/l2-dual-cursor-brief.js`。
+- **prompt 提交**:settle 只作兜底;成功以开工确认(`working|done|blocked`)为准,不信假 idle。
 - **read 不是权威源**:回滚窗口有限、长输出会滚掉。判官/收集应以外部权威源(agent 写出的文件、Bus transcript)为准,不单靠 `read`。
 - **收资源**:用完 `kill` / `kill --all`;关闭失败会保留台账条目以便重试回收。

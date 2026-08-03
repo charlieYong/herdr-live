@@ -7,7 +7,8 @@
     "herdr-live": "bin/herdr-live.js"
   },
   "scripts": {
-    "selftest": "node test/selftest.js"
+    "selftest": "node test/selftest.js",
+    "test:l2": "node test/l2-dual-cursor-brief.js"
   },
   "license": "MIT"
 }

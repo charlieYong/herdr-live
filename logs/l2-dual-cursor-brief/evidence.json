@@ -1,0 +1,91 @@
+{
+  "startedAt": "2026-08-03T05:18:11.376Z",
+  "briefABytes": 3605,
+  "briefBBytes": 3600,
+  "workA": "/tmp/hl-l2-a-71rKrM",
+  "workB": "/tmp/hl-l2-b-w08uKr",
+  "tokenA": "L2A_mscs39o0",
+  "tokenB": "L2B_mscs39o0",
+  "sideA": {
+    "model": "cursor-grok-4.5-high",
+    "transport": "brief-pointer",
+    "startState": "working",
+    "confirmMs": 1272,
+    "finish": "done",
+    "marker": "L2A_mscs39o0",
+    "reportExists": true,
+    "readTail": "→ Add a follow-up\n\n\n  Cursor Grok 4.5 High · 7.2% · 1 file edited                                                                                                                                                                    Run Everything\n  /tmp/hl-l2-a-71rKrM"
+  },
+  "sideB": {
+    "model": "cursor-grok-4.5-high",
+    "transport": "brief-pointer",
+    "startState": "working",
+    "confirmMs": 1277,
+    "finish": "done",
+    "marker": "L2B_mscs39o0",
+    "reportExists": true,
+    "readTail": ""
+  },
+  "checks": [
+    {
+      "name": "A default model",
+      "ok": true
+    },
+    {
+      "name": "B default model",
+      "ok": true
+    },
+    {
+      "name": "A brief-pointer",
+      "ok": true
+    },
+    {
+      "name": "B brief-pointer",
+      "ok": true
+    },
+    {
+      "name": "A marker",
+      "ok": true
+    },
+    {
+      "name": "B marker",
+      "ok": true
+    },
+    {
+      "name": "A report",
+      "ok": true
+    },
+    {
+      "name": "B report",
+      "ok": true
+    },
+    {
+      "name": "briefs >2KB",
+      "ok": true
+    }
+  ],
+  "verdict": "PASS",
+  "kills": [
+    {
+      "name": "hl-l2-cursor-a",
+      "closed": true,
+      "reclaimed": true,
+      "target": {
+        "kind": "tab",
+        "id": "w3:t12"
+      },
+      "errors": []
+    },
+    {
+      "name": "hl-l2-cursor-b",
+      "closed": true,
+      "reclaimed": true,
+      "target": {
+        "kind": "tab",
+        "id": "w3:t13"
+      },
+      "errors": []
+    }
+  ],
+  "finishedAt": "2026-08-03T05:18:40.013Z"
+}

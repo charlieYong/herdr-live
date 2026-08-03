@@ -22,13 +22,17 @@
 ## 五个核心动词
 
 ```
-herdr-live spawn <name> --kind <cursor|claude|codex> --model <m> [--cwd <dir>] [--label <l>]
+herdr-live spawn <name> --kind <cursor|claude|codex> [--model <m>] [--cwd <dir>] [--label <l>]
     # = tab create(拿 pane_id/tab_id)+ agent start(按 kind 拼对 executor flags)
+    # --model 可省略：用 kinds.js 与 herdr-orchestrator 对齐的 defaultModel
     # 返回 { name, pane_id, tab_id, kind, model, cwd, state }
 
-herdr-live prompt <name> --text <t> | --file <path> [--wait-until <s>[,<s>]] [--timeout-ms <n>] [--settle-ms <n>]
-    # = agent prompt + settle 延时 + send-keys enter 提交
-    # --wait-until 封装等待到目标状态
+herdr-live prompt <name> --text <t> | --file <path> | --brief-file <path>
+    [--wait-until <s>[,<s>]] [--timeout-ms <n>] [--settle-ms <n>] [--force-paste]
+    # = agent prompt + settle + send-keys enter，再短窗确认开工
+    # --brief-file：短指针投喂（agent 自己 Read 文件）——大内容首选
+    # --file/--text：整段 paste，软上限 ~2KB；超限请改 --brief-file
+    # 成功前必须见到 working|done|blocked；仍 idle 视为未发出并报错
 
 herdr-live read <name> [--tail <N>]
     # = agent read,读完整对话回滚窗口(可选只取尾部)
@@ -44,11 +48,16 @@ herdr-live kill <name> | --all  # 关 tab 收资源,清台账
 
 ## 内建知识(把踩过的坑固化进工具)
 
-- **kind→flags 映射**(`src/kinds.js`):cursor/claude/codex 的 executor flags 从配置读,
-  不让调用者手拼。照搬 herdr config 的 `[agent.<kind>.executor]`。
-- **prompt 提交竞态**:`agent prompt` 只填充输入框、不提交;需随后 `send-keys enter`。
-  且填充与 enter 之间有竞态——enter 太快会在填充落定前触发导致 prompt 滞留不发。
-  故默认插入 1000ms settle 延时(实测 <1s 偶发滞留、≥1s 稳定)。可用 `--settle-ms` 调。
+- **kind→flags + defaultModel**(`src/kinds.js`):cursor/claude/codex 的 executor flags
+  与 default_model 对齐 herdr-orchestrator `config.toml`，不让调用者手拼。
+  spawn 解析顺序：显式 `--model` > kind 默认 > 报错。
+- **prompt 提交竞态 + 开工确认**:`agent prompt` 只填充输入框、不提交;需随后
+  `send-keys enter`。填充与 enter 之间有竞态——故默认 settle（cursor/claude 1s，
+  codex 2s）只作兜底。更关键：短窗内必须见到 `working|done|blocked`，否则抛错；
+  **禁止**返回 `{submitted:true, state:idle}` 假成功。
+- **大 prompt 用短指针**:整段 paste 软上限 ~2KB。长说明书落盘后用 `--brief-file`
+  （工具只发「请 Read 此路径」指针）。注意：旧 `--file` 仍是「读文件再整段塞框」，
+  不是指针投喂。
 - **read source**:用默认 source(完整对话);`--source recent-unwrapped` 只回状态栏、
   几乎为空(那是 busy 签名检测的小窗口)。回滚窗口有限,超长输出会滚掉——判官应以
   外部权威源(如 Bus transcript)为准,不单靠 read。
@@ -69,22 +78,25 @@ spawn→prompt→collect。是否中继、如何基于输出决策由 scene 声�
 ```json
 {
   "agents": [
-    { "name": "a", "kind": "cursor", "model": "cursor-grok-4.5-high", "cwd": "/path",
-      "prompt": "初始指令", "waitUntil": ["idle", "done"], "timeoutMs": 300000 }
+    { "name": "a", "kind": "cursor", "cwd": "/path",
+      "briefFile": "/path/to/long-brief.md",
+      "waitUntil": ["idle", "done"], "timeoutMs": 300000 }
   ],
   "collect": [ { "agent": "a", "tail": 40 } ]
 }
 ```
 
-## 自测
+## 自测 / 验收分层
 
 ```
-npm run selftest              # 确定性核:kind→flags、deepId、台账往返(无需真 agent)
-node test/live-happy-path.js  # 真 agent happy-path:起 cursor → echo 到文件 → read → kill
-                              # 需真 herdr 环境;可用 HL_MODEL / HL_KIND 覆盖
+npm run selftest                      # L0 确定性核:defaultModel、开工确认、brief-file、台账
+node test/live-happy-path.js          # L1 单端真 agent:spawn → echo 到文件 → read → kill
+node test/l2-dual-cursor-brief.js     # L2 双端 cursor:无 --model + --brief-file 并行实测
+                                      # L1/L2 需 HERDR_ENV=1;证据落 logs/l2-dual-cursor-brief/
 ```
 
 ## 模型 slug 陷阱
 
-`cursor-agent` 的 slug ≠ `claude` CLI 的 slug。`cursor-grok-4.5-high` 在 cursor 下可用;
-claude kind 的 model slug 有陷阱(见 herdr config 注释),使用前自校验。
+`cursor-agent` 的 slug ≠ `claude` CLI 的 slug。缺省时用 kinds.js 默认
+（cursor=`cursor-grok-4.5-high`，claude=`custom-model-a4`，codex=`custom-model-b5-standard`）；
+覆盖 `--model` 前请自校验 slug。
