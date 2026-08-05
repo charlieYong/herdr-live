@@ -276,8 +276,128 @@ async function checkAsync(name, fn) {
       });
       assert.strictEqual(res.transport, 'brief-pointer');
       assert.ok(promptedBody.includes(briefPath));
+      assert.ok(promptedBody.includes('请完整阅读并严格按此文件执行'));
       assert.ok(!promptedBody.includes('xxxxx'), '不应整段 paste 大文件');
       assert.ok(res.promptBytes < PASTE_SOFT_LIMIT_BYTES);
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('prompt：--brief-style answer 不用派工腔', async () => {
+    const briefPath = path.join(tmpHome, 'resume-prompt.md');
+    fs.writeFileSync(briefPath, '人已选定：B\n从挂起点继续\n');
+    ledger.put('promptAnswer', {
+      pane_id: 'w1:p4', tab_id: 'w1:t4', kind: 'cursor', model: 'm', cwd: '/work',
+    });
+    let promptedBody = null;
+    herdrMod.herdr = (args) => {
+      if (args[0] === 'agent' && args[1] === 'prompt') promptedBody = args[3];
+      return 'ok';
+    };
+    herdrMod.agentRecord = () => ({ name: 'promptAnswer' });
+    herdrMod.agentState = () => 'working';
+    try {
+      const res = await live.prompt('promptAnswer', null, {
+        briefFile: briefPath,
+        briefStyle: 'answer',
+        confirmStartMs: 2000,
+        settleMs: 0,
+      });
+      assert.strictEqual(res.transport, 'brief-pointer-answer');
+      assert.ok(promptedBody.includes('人已答复'));
+      assert.ok(promptedBody.includes(briefPath));
+      assert.ok(!/请完整阅读并严格/.test(promptedBody));
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  check('isPaneId / resolveSubmitTarget：pane_id 与台账名', () => {
+    assert.strictEqual(live.isPaneId('w3:p16'), true);
+    assert.strictEqual(live.isPaneId('w3:p3G'), true);
+    assert.strictEqual(live.isPaneId('va-hl-submit'), false);
+    ledger.put('namedAgent', {
+      pane_id: 'w1:p5', tab_id: 'w1:t5', kind: 'cursor', model: 'm', cwd: '/c',
+    });
+    const byName = live.resolveSubmitTarget('namedAgent');
+    assert.strictEqual(byName.via, 'ledger_name');
+    assert.strictEqual(byName.herdrTarget, 'namedAgent');
+    herdrMod.agentRecord = () => {
+      throw new herdrMod.HerdrError('stub: no probe');
+    };
+    try {
+      const byPane = live.resolveSubmitTarget('w9:p99', { kind: 'cursor' });
+      assert.strictEqual(byPane.via, 'pane_id');
+      assert.strictEqual(byPane.herdrTarget, 'w9:p99');
+      assert.strictEqual(byPane.kind, 'cursor');
+    } finally {
+      herdrMod.agentRecord = realAgentRecord;
+    }
+  });
+
+  await checkAsync('submitPrompt：pane_id 路径仍调用 enter（无台账）', async () => {
+    const calls = [];
+    herdrMod.herdr = (args) => {
+      calls.push(args);
+      return 'ok';
+    };
+    herdrMod.agentRecord = (t) => ({
+      name: t, pane_id: 'w9:p42', agent: 'cursor', agent_status: 'working', cwd: '/wake',
+    });
+    herdrMod.agentState = () => 'working';
+    try {
+      // 刻意不写 ledger——叫醒场景常见
+      assert.strictEqual(ledger.get('w9:p42'), null);
+      const res = await live.submitPrompt({
+        target: 'w9:p42',
+        text: 'wake brief',
+        confirmStartMs: 2000,
+        settleMs: 0,
+      });
+      assert.strictEqual(res.submitted, true);
+      assert.strictEqual(res.confirmed, true);
+      assert.strictEqual(res.via, 'pane_id');
+      assert.strictEqual(res.target, 'w9:p42');
+      assert.ok(calls.some((a) => a[0] === 'agent' && a[1] === 'prompt' && a[2] === 'w9:p42'));
+      assert.ok(
+        calls.some((a) => a[0] === 'agent' && a[1] === 'send-keys' && a[2] === 'w9:p42' && a[3] === 'enter'),
+        'pane_id 路径必须 send-keys enter'
+      );
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('submitPrompt：确认失败抛错（禁止假 submitted）', async () => {
+    const calls = [];
+    herdrMod.herdr = (args) => {
+      calls.push(args);
+      return 'ok';
+    };
+    herdrMod.agentRecord = () => ({ pane_id: 'w9:p43', agent: 'cursor' });
+    herdrMod.agentState = () => 'idle';
+    try {
+      let threw = false;
+      try {
+        await live.submitPrompt({
+          target: 'w9:p43',
+          text: 'hi',
+          confirmStartMs: 400,
+          settleMs: 0,
+        });
+      } catch (e) {
+        threw = true;
+        assert.ok(/未确认开工/.test(e.message), e.message);
+      }
+      assert.ok(threw, '应抛错，不得返回 submitted:true');
+      assert.ok(calls.some((a) => a[1] === 'send-keys' && a[3] === 'enter'));
     } finally {
       herdrMod.herdr = realHerdr;
       herdrMod.agentRecord = realAgentRecord;

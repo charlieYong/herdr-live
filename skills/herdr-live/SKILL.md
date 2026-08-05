@@ -9,6 +9,18 @@ description: "在 Herdr 里轻量地起多个真交互式 agent(cursor/claude/co
 底层 CLI 的一层薄封装,把易错的底层序列变成语义明确的五个动词。工具在独立工程
 `~/charlie/herdr-live`;完整用法见其 `README.md`,设计见 `design.md`,典型场景见 `scenarios.md`。
 
+## ⛔ 投喂红线（先看这个）
+
+**投喂必须用 `herdr-live prompt` / 库 `submitPrompt`。禁止只用 `herdr agent prompt` 当投喂。**
+
+| 反模式 | 正确做法 |
+|---|---|
+| ❌ `herdr agent prompt <target> <text>` 然后当已发送 | ✅ `$HL prompt …` 或 `submitPrompt({ target, text\|file\|briefFile })` |
+| ❌ 只填充输入框、自己拼底层五动词「差不多就行」 | ✅ 完整序列：prompt → settle → **send-keys enter** → 确认 `working\|done\|blocked` |
+| ❌ 叫醒场景有 pane_id 就直接 raw prompt | ✅ `submitPrompt({ target: 'w3:p16', … })`（无台账也必须 enter+确认） |
+
+`herdr agent prompt` = **只填充、不提交**。假成功（框里有字、agent 仍 idle）会害编排者以为已叫醒/已派活。
+
 ## 前置(先验,不过就停手)
 
 必须在 Herdr pane 内运行:
@@ -27,18 +39,26 @@ test "${HERDR_ENV:-}" = 1
 - **不发明状态机**:agent 生命周期状态直接透传 herdr 的 `idle` / `working` / `done` / `blocked`。
 - **中性通用**:是否在 agent 间中继消息、如何基于输出决策,由**调用者**定;工具不预设领域约束。
 
-## 五个动词(调用一律用绝对路径,不依赖 PATH)
+## 五个动词(推荐 PATH；无 PATH 时用单路径 `$HL`)
+
+优先：`~/.local/bin/herdr-live` → `bin/herdr-live.js` 的 symlink（或 `npm` bin），直接 `herdr-live …`。
+无 PATH 时：`$HL` **只存带 shebang 的单可执行路径**——**禁止**把 `node` 与脚本路径拼进同一 `$HL` 变量（zsh 默认不拆词，整串会当命令名失败）。
 
 ```bash
-HL="node ~/charlie/herdr-live/bin/herdr-live.js"
+# 推荐（已在 PATH 时）
+herdr-live list
+
+# 或单路径变量（bash/zsh 皆安全）
+HL="$HOME/charlie/herdr-live/bin/herdr-live.js"
 
 $HL spawn <name> --kind <cursor|claude|codex> [--model <m>] [--cwd <dir>] [--label <l>]
     # --model 可省略（kinds 默认对齐 herdr-orchestrator）
 
-$HL prompt <name> --brief-file <path> | --text <t> | --file <path>
+$HL prompt <name|pane_id> --brief-file <path> | --text <t> | --file <path>
     [--wait-until <s>[,<s>]] [--timeout-ms <n>] [--settle-ms <n>] [--force-paste]
     # 大内容用 --brief-file（短指针）；--file 仍是整段 paste（≠指针）
     # 成功前确认 working|done|blocked；假 idle 会失败退出
+    # ⛔ 禁止用 raw herdr agent prompt 代替（只填充不提交）
 
 $HL read <name> [--tail <N>]        # 读 agent 对话输出
 $HL wait <name> [--until <s>[,<s>]] [--timeout-ms <n>]   # 轮询到目标状态(默认 idle,done)
@@ -47,8 +67,11 @@ $HL kill <name> | --all             # 关 tab 收资源,清台账
 $HL scene <scene.json>              # 声明式批量编排:spawn→prompt→collect
 ```
 
+库调用（voice-agent 叫醒等）：`const { submitPrompt } = require('…/herdr-live/src/live')`，见 README「库 API」。
+
 ## 必须知道的坑(否则会踩)
 
+- **禁止只用 herdr agent prompt 当投喂**:那是只填充；必须走 herdr-live `prompt`/`submitPrompt`（含 enter+确认）。
 - **大 prompt 用短指针**:说明书落盘后 `--brief-file`;不要整段 paste 多 KB 进输入框
   （软上限 ~2KB）。`--file` ≠ `--brief-file`。
 - **不要信假 submitted**:旧行为可能返回 `{submitted:true, state:idle}` 而 prompt 仍在框里。
@@ -63,6 +86,7 @@ $HL scene <scene.json>              # 声明式批量编排:spawn→prompt→col
 
 见 `~/charlie/herdr-live/scenarios.md`。速记五类:①双端协商/对齐 ②多方案并行生成择优
 ③群体评审/红蓝对练 ④批量同构任务 ⑤人在场的交互式探查。每类都附了"该用它而不是 X"的边界。
+投喂一律走 `prompt`/`submitPrompt`，不要抄底层 `herdr agent prompt`。
 
 ## 用完收资源
 

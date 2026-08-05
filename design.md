@@ -5,7 +5,8 @@
 > 缘起于 agent2agent 的双 harness spike(见其 ADR-0010),但工具本身独立、通用,agent2agent 只是第一个消费者。
 > **现状**:已按本设计落地为 Node CLI(五动词 spawn/prompt/read/wait/kill + scene)。
 > 另已加固:`spawn` 可省略 `--model`(kind 默认对齐 herdr-orchestrator)、`prompt` 开工确认禁止假
-> `submitted+idle`、大内容用 `--brief-file` 短指针。L0/L1/L2(双 cursor brief-file)均已通过。
+> `submitted+idle`、大内容用 `--brief-file` 短指针。库级 **`submitPrompt({ target })`** 支持 pane_id
+> 与台账名完整提交（enter+确认）；投喂禁止 raw `herdr agent prompt`（只填充）。L0/L1/L2 均已通过。
 
 ## 1. 为什么要它(问题)
 

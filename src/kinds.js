@@ -94,14 +94,27 @@ function submitNeedsEnter(kind) {
 }
 
 /**
- * 把落盘的长说明书变成短指针（方案 A）：输入框只发指针，正文由 agent 自己 Read。
+ * 把落盘说明书变成短指针（方案 A）：输入框只发指针，正文由 agent 自己 Read。
  * @param {string} absPath
- * @param {{ cwd?: string }} [opts]
+ * @param {{ cwd?: string, style?: 'dispatch'|'answer' }} [opts]
+ *   - dispatch（默认）：长任务书 / 初次派发
+ *   - answer：对人决策的短答复续跑（禁止「请完整阅读并严格执行」腔）
  */
 function buildBriefPointer(absPath, opts = {}) {
+  const style = opts.style === 'answer' ? 'answer' : 'dispatch';
+  const abs = String(absPath);
+  if (style === 'answer') {
+    const lines = [
+      '人已答复（这是对当前挂起问题的续跑指示，不是新任务派发）。',
+      '请 Read 下列短文，从挂起点继续：',
+      abs,
+    ];
+    if (opts.cwd) lines.push(`工作目录：${opts.cwd}`);
+    return lines.join('\n');
+  }
   const lines = [
     '请完整阅读并严格按此文件执行（不要摘要、不要跳过步骤）：',
-    String(absPath),
+    abs,
   ];
   if (opts.cwd) lines.push(`工作目录：${opts.cwd}`);
   lines.push('读完后立刻按文件中的步骤开工。');

@@ -3,6 +3,13 @@
   "version": "0.1.0",
   "description": "通用多 agent live 编排：起 N 个真 harness agent、喂 prompt、读输出/状态。herdr 底层能力的一层薄封装。",
   "type": "commonjs",
+  "main": "src/live.js",
+  "exports": {
+    ".": "./src/live.js",
+    "./live": "./src/live.js",
+    "./herdr": "./src/herdr.js",
+    "./kinds": "./src/kinds.js"
+  },
   "bin": {
     "herdr-live": "bin/herdr-live.js"
   },
