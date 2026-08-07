@@ -16,10 +16,14 @@
 
 | 做法 | 实际效果 |
 |---|---|
-| ✅ `herdr-live prompt …` / `live.submitPrompt({…})` | 填充 → settle → **send-keys enter** → 短窗确认 `working\|done\|blocked` |
-| ❌ raw `herdr agent prompt` | **只填充输入框、不提交**；agent 仍 idle，调用方却以为已投喂 |
+| ✅ `herdr-live prompt …` / `live.submitPrompt({…})` | 版本感知 transport + per-target 锁 + **结构化 fail-closed receipt** |
+| ❌ raw `herdr agent prompt` | **只填充输入框、不提交**（0.7.5）；调用方却以为已投喂 |
 
-不要用底层五动词拼「假投喂」。pane_id 叫醒场景同样走 `submitPrompt({ target: pane_id, … })`——**无台账也必须 enter + 确认**，禁止「只 prompt」。
+**Receipt `transport_phase`：** `not_sent`（可重试）→ `prompt_filled` → `enter_sent` → `lifecycle_observed`；任何投递开始后的不确定结果为 `ambiguous`（**禁止自动重发**）。不声称 server 级 queue/write ack。
+
+**版本 profile：** 官方 `herdr 0.7.5` → prompt→settle→Enter；`core-managed-enter` 禁止二次 Enter；unknown fail-closed。
+
+不要用底层五动词拼「假投喂」。pane_id 叫醒场景同样走 `submitPrompt({ target: pane_id, … })`。
 
 ---
 
@@ -45,11 +49,14 @@ herdr-live spawn <name> --kind <cursor|claude|codex> [--model <m>] [--cwd <dir>]
 
 herdr-live prompt <name|pane_id> --text <t> | --file <path> | --brief-file <path>
     [--wait-until <s>[,<s>]] [--timeout-ms <n>] [--settle-ms <n>] [--force-paste]
-    # = live.submitPrompt：agent prompt + settle + send-keys enter，再短窗确认开工
+    [--submission-id <id>] [--receipt-path <path>] [--persist-receipt]
+    [--transport-profile official-0.7.5|core-managed-enter] [--kind <kind>]
+    # = live.submitPrompt：加锁、按版本执行 transport、输出结构化 receipt
     # target 可为台账名或 pane_id（如 w3:p16；叫醒常有 pane_id、未必在台账）
     # --brief-file：短指针投喂（agent 自己 Read 文件）——大内容首选
     # --file/--text：整段 paste，软上限 ~2KB；超限请改 --brief-file
-    # 成功前必须见到 working|done|blocked；仍 idle 视为未发出并报错
+    # 已 working/done/blocked 的 baseline 不能证明新 prompt；须观察本次之后的状态/序号推进
+    # 非 lifecycle_observed 会非零退出，但仍尽量在 stdout/receipt-path 保留 receipt
     # ⛔ 不要用 raw herdr agent prompt 代替本命令（只填充、不提交）
 
 herdr-live read <name> [--tail <N>]
@@ -72,25 +79,44 @@ CLI 与库共用同一实现（`src/live.js`）。从其他 Node 工程调用：
 const { submitPrompt } = require('/home/user_00/charlie/herdr-live/src/live');
 // 或：require('herdr-live')（若已 npm link / 本地 path 依赖）
 
-await submitPrompt({
+const receipt = await submitPrompt({
   target: 'w3:p16',           // pane_id 或 herdr-live / herdr 名
   text: '短指令',             // 或 file / briefFile
+  submissionId: 'task-42:executor-a1:ctrl-1',
   settleMs: 1000,             // 可选；默认按 kind
   confirmStartMs: 10000,
+  persistReceipt: true,
 });
-// 成功 → { submitted:true, confirmed:true, state:'working'|…, via:'pane_id'|… }
-// 失败 → 抛错（禁止假 submitted）
+// 成功：receipt.transport_phase === 'lifecycle_observed'
+// 失败会 throw，结构化事实保留在 error.receipt / error.transport_phase：
+//   not_sent（唯一可重试相位）或 ambiguous（禁止自动重发）
 ```
+
+### Receipt 与恢复规则
+
+Receipt 绑定 `submission_id`、prompt SHA-256、exact target、baseline/observed lifecycle、
+Herdr version/profile、相位和时间戳。它是 wrapper transport 的审计事实，不是 server
+exactly-once acknowledgement，也不证明 Agent 理解或完成任务。
+
+- `not_sent`：首个 transport 调用尚未开始；调用方可做有界重试。
+- `prompt_filled` / `enter_sent`：transport 已开始；不能据此重发。
+- `lifecycle_observed`：观察到相对 baseline 的新 lifecycle 证据。
+- `ambiguous`：transport 后结果不可证明；必须停止自动重发，由上层关闭旧 Worker 后重派。
+- missing/malformed receipt 同样 fail-closed。
+
+Per-target lock 按 Herdr socket/session + pane 串行 wrapper-managed 输入。只有 owner PID 已
+消失才允许回收 stale lock，并在 `finally` 释放。它不覆盖人手或 raw Herdr 输入。
 
 ## 内建知识(把踩过的坑固化进工具)
 
 - **kind→flags + defaultModel**(`src/kinds.js`):cursor/claude/codex 的 executor flags
   与 default_model 对齐 herdr-orchestrator `config.toml`，不让调用者手拼。
   spawn 解析顺序：显式 `--model` > kind 默认 > 报错。
-- **prompt 提交竞态 + 开工确认**:`agent prompt` 只填充输入框、不提交;需随后
-  `send-keys enter`。填充与 enter 之间有竞态——故默认 settle（cursor/claude 1s，
-  codex 2s）只作兜底。更关键：短窗内必须见到 `working|done|blocked`，否则抛错；
-  **禁止**返回 `{submitted:true, state:idle}` 假成功。
+- **版本化 prompt transport**：官方 0.7.5 的 `agent prompt` 只填充输入框，profile
+  执行 settle 后显式 Enter；core-managed-enter profile 禁止 wrapper 再发 Enter；未知
+  profile fail-closed。explicit-enter 由 profile 决定，不能被 kind 标志压制。
+- **baseline-aware 开工确认**：提交前记录 state/`state_change_seq`。已有 working/done/
+  blocked 不能证明本次投递；只有之后的序号/状态推进才可进入 `lifecycle_observed`。
 - **大 prompt 用短指针**:整段 paste 软上限 ~2KB。长说明书落盘后用 `--brief-file`
   （工具只发「请 Read 此路径」指针）。**决策续跑**用 `--file` 直贴短文，或
   `--brief-file … --brief-style answer`（禁止默认派工腔）。注意：旧 `--file` 是

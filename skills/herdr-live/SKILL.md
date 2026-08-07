@@ -16,10 +16,16 @@ description: "在 Herdr 里轻量地起多个真交互式 agent(cursor/claude/co
 | 反模式 | 正确做法 |
 |---|---|
 | ❌ `herdr agent prompt <target> <text>` 然后当已发送 | ✅ `$HL prompt …` 或 `submitPrompt({ target, text\|file\|briefFile })` |
-| ❌ 只填充输入框、自己拼底层五动词「差不多就行」 | ✅ 完整序列：prompt → settle → **send-keys enter** → 确认 `working\|done\|blocked` |
-| ❌ 叫醒场景有 pane_id 就直接 raw prompt | ✅ `submitPrompt({ target: 'w3:p16', … })`（无台账也必须 enter+确认） |
+| ❌ 只填充输入框、自己拼底层五动词「差不多就行」 | ✅ 让 version profile 独占 Enter 决策并返回结构化 receipt |
+| ❌ 叫醒场景有 pane_id 就直接 raw prompt | ✅ `submitPrompt({ target: 'w3:p16', … })`（无台账也必须加锁、按版本提交并确认） |
 
-`herdr agent prompt` = **只填充、不提交**。假成功（框里有字、agent 仍 idle）会害编排者以为已叫醒/已派活。
+官方 Herdr 0.7.5 的 `herdr agent prompt` = **只填充、不提交**。其它版本不得猜测，
+必须由 profile 决定。假成功（框里有字、agent 仍 idle）会害编排者以为已叫醒/已派活。
+
+生产契约：官方 Herdr 0.7.5 profile 执行 prompt→settle→显式 Enter；
+`core-managed-enter` 禁止二次 Enter；unknown fail-closed。Receipt 只有
+`lifecycle_observed` 表示观察到本次之后的新 lifecycle 证据。仅 `not_sent` 可有界重试；
+`ambiguous`、missing/malformed 或其它 post-transport 相位禁止自动重发。
 
 ## 前置(先验,不过就停手)
 
@@ -56,8 +62,10 @@ $HL spawn <name> --kind <cursor|claude|codex> [--model <m>] [--cwd <dir>] [--lab
 
 $HL prompt <name|pane_id> --brief-file <path> | --text <t> | --file <path>
     [--wait-until <s>[,<s>]] [--timeout-ms <n>] [--settle-ms <n>] [--force-paste]
+    [--submission-id <id>] [--receipt-path <path>] [--persist-receipt]
+    [--transport-profile official-0.7.5|core-managed-enter] [--kind <kind>]
     # 大内容用 --brief-file（短指针）；--file 仍是整段 paste（≠指针）
-    # 成功前确认 working|done|blocked；假 idle 会失败退出
+    # 成功 receipt.transport_phase=lifecycle_observed；其余非零但保留 receipt
     # ⛔ 禁止用 raw herdr agent prompt 代替（只填充不提交）
 
 $HL read <name> [--tail <N>]        # 读 agent 对话输出
@@ -71,13 +79,17 @@ $HL scene <scene.json>              # 声明式批量编排:spawn→prompt→col
 
 ## 必须知道的坑(否则会踩)
 
-- **禁止只用 herdr agent prompt 当投喂**:那是只填充；必须走 herdr-live `prompt`/`submitPrompt`（含 enter+确认）。
+- **禁止只用 herdr agent prompt 当投喂**：0.7.5 下那只是填充；必须走 herdr-live
+  `prompt`/`submitPrompt`（版本 profile + per-target lock + receipt）。
 - **大 prompt 用短指针**:说明书落盘后 `--brief-file`;不要整段 paste 多 KB 进输入框
   （软上限 ~2KB）。`--file` ≠ `--brief-file`。
-- **不要信假 submitted**:旧行为可能返回 `{submitted:true, state:idle}` 而 prompt 仍在框里。
-  现已改为开工确认失败即非 0。编排者应看返回的 `confirmed`/`state`,或继续 `wait`。
-- **prompt 提交竞态**:settle 只是兜底(cursor/claude ~1s, codex ~2s);大内容优先 brief-file,
-  别靠把 `--settle-ms` 调到很大。
+- **只按 receipt 相位决策**：已有 working/done/blocked baseline 不证明新 prompt；只接受
+  `lifecycle_observed`。只有 `not_sent` 可重试；`ambiguous` 必须停止投递并由上层关闭旧
+  Worker 后重派。
+- **prompt 提交竞态**：0.7.5 的 settle 是 transport 步骤，不是成功证据；大内容优先
+  brief-file，别靠把 `--settle-ms` 调到很大。
+- **合作锁边界**：lock 只串行 wrapper callers，不覆盖人手/raw Herdr 输入；同一 target
+  不得混用两种路径。
 - **read 不是权威源**:回滚窗口有限、长输出会滚掉。需要可靠回收产物时,让 agent **写文件**
   (或写到 Bus/外部 transcript),再去读文件,不要单靠 `read` 的终端输出。
 - **model slug**:缺省用 kinds 默认;覆盖前自校验(claude slug ≠ cursor slug)。

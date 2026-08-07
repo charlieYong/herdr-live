@@ -7,6 +7,7 @@
 
 const live = require('../src/live');
 const { runScene } = require('../src/scene');
+const receiptMod = require('../src/receipt');
 
 // 极简 flag 解析：--k v / --k=v / --flag（布尔）。位置参数进 _[]。
 function parseArgs(argv) {
@@ -49,13 +50,14 @@ const USAGE = `herdr-live — 通用多 agent live 编排
     # --model 可省略：用 kinds.js 与 herdr-orchestrator 对齐的 defaultModel
   herdr-live prompt <name|pane_id> --text <t> | --file <path> | --brief-file <path>
       [--brief-style dispatch|answer] [--wait-until <state>] [--timeout-ms <n>] [--settle-ms <n>]
-      [--confirm-start-ms <n>] [--force-paste]
-    # = live.submitPrompt（完整提交：prompt→settle→enter→确认开工）
+      [--confirm-start-ms <n>] [--force-paste] [--submission-id <id>] [--receipt-path <path>]
+      [--persist-receipt] [--transport-profile official-0.7.5|core-managed-enter]
+      [--kind <kind>]
+    # = live.submitPrompt（canonical transport + 结构化 fail-closed receipt）
     # target 可为台账名或 pane_id（如 w3:p16；无台账亦可）
-    # --brief-file：短指针投喂（agent 自己 Read 文件）；大内容首选
-    # --brief-style answer：决策答复/续跑指针（禁止「请完整阅读并严格执行」腔）
-    # --file/--text：整段 paste，软上限 ~2KB；超限请改 --brief-file 或 --force-paste
-    # 成功返回前确认进入 working|done|blocked（禁止假 submitted + idle）
+    # 官方 0.7.5：prompt→settle→enter；core-managed-enter 禁止二次 Enter
+    # 仅 transport_phase=not_sent 可自动重试；post-transport 不确定 → ambiguous
+    # 成功/失败均尽量打印 receipt JSON（stdout）；不声称 server 级 queue/write ack
     # 禁止用 raw「herdr agent prompt」当投喂——那只填充输入框、不提交
   herdr-live read <name> [--tail <N>]
   herdr-live wait <name> [--until <state>[,<state>]] [--timeout-ms <n>] [--poll-ms <n>]
@@ -63,7 +65,8 @@ const USAGE = `herdr-live — 通用多 agent live 编排
   herdr-live kill <name> | --all
   herdr-live scene <scene.json>
 
-状态透传 herdr：idle / working / done / blocked。`;
+状态透传 herdr：idle / working / done / blocked。
+Receipt phases：not_sent | prompt_filled | enter_sent | lifecycle_observed | ambiguous。`;
 
 async function main() {
   const [verb, ...rest] = process.argv.slice(2);
@@ -94,23 +97,44 @@ async function main() {
       if (text == null && !args.file && !args['brief-file']) {
         fail('prompt 需要 --text、--file 或 --brief-file');
       }
-      const res = await live.submitPrompt({
-        target,
-        text,
-        file: args.file || undefined,
-        briefFile: args['brief-file'] || undefined,
-        briefStyle: args['brief-style'] || undefined,
-        waitUntil: args['wait-until'] ? String(args['wait-until']).split(',') : undefined,
-        timeoutMs: args['timeout-ms'] ? Number(args['timeout-ms']) : undefined,
-        settleMs: args['settle-ms'] !== undefined ? Number(args['settle-ms']) : undefined,
-        confirmStartMs: args['confirm-start-ms'] !== undefined
-          ? Number(args['confirm-start-ms'])
-          : undefined,
-        forcePaste: Boolean(args['force-paste']),
-        skipConfirmStart: Boolean(args['skip-confirm-start']),
-        kind: args.kind || undefined,
-      });
-      print(res);
+      try {
+        const res = await live.submitPrompt({
+          target,
+          text,
+          file: args.file || undefined,
+          briefFile: args['brief-file'] || undefined,
+          briefStyle: args['brief-style'] || undefined,
+          waitUntil: args['wait-until'] ? String(args['wait-until']).split(',') : undefined,
+          timeoutMs: args['timeout-ms'] ? Number(args['timeout-ms']) : undefined,
+          settleMs: args['settle-ms'] !== undefined ? Number(args['settle-ms']) : undefined,
+          confirmStartMs: args['confirm-start-ms'] !== undefined
+            ? Number(args['confirm-start-ms'])
+            : undefined,
+          forcePaste: Boolean(args['force-paste']),
+          skipConfirmStart: Boolean(args['skip-confirm-start']),
+          kind: args.kind || undefined,
+          submissionId: args['submission-id'] || undefined,
+          receiptPath: args['receipt-path'] || undefined,
+          persistReceipt: Boolean(args['persist-receipt']),
+          forceProfile: args['transport-profile'] || undefined,
+        });
+        print(res);
+        if (res.transport_phase && res.transport_phase !== 'lifecycle_observed' && !args['skip-confirm-start']) {
+          // enter_sent without confirm is only OK with skip-confirm-start
+          if (res.transport_phase !== 'enter_sent' || !args['skip-confirm-start']) {
+            process.exitCode = res.transport_phase === 'not_sent' ? 3 : 2;
+          }
+        }
+      } catch (e) {
+        if (e && e.receipt) {
+          print(e.receipt);
+          const phase = e.receipt.transport_phase || e.transport_phase;
+          process.exitCode = phase === 'not_sent' ? 3 : 2;
+          process.stderr.write(`[herdr-live] ${e.message}\n`);
+        } else {
+          fail(e && e.message ? e.message : String(e));
+        }
+      }
       break;
     }
     case 'read': {
@@ -150,6 +174,13 @@ async function main() {
       if (!file) fail('scene 需要 <scene.json>');
       const res = await runScene(file);
       print(res);
+      break;
+    }
+    case 'receipt-cleanup': {
+      print(receiptMod.cleanupReceipts({
+        maxAgeMs: args['max-age-ms'] != null ? Number(args['max-age-ms']) : undefined,
+        maxFiles: args['max-files'] != null ? Number(args['max-files']) : undefined,
+      }));
       break;
     }
     default:

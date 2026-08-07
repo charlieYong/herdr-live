@@ -4,9 +4,11 @@
 > 本文记录**设计动机、边界与落地历程**;用法/坑清单见 [`README.md`](./README.md),典型使用场景见 [`scenarios.md`](./scenarios.md)。
 > 缘起于 agent2agent 的双 harness spike(见其 ADR-0010),但工具本身独立、通用,agent2agent 只是第一个消费者。
 > **现状**:已按本设计落地为 Node CLI(五动词 spawn/prompt/read/wait/kill + scene)。
-> 另已加固:`spawn` 可省略 `--model`(kind 默认对齐 herdr-orchestrator)、`prompt` 开工确认禁止假
-> `submitted+idle`、大内容用 `--brief-file` 短指针。库级 **`submitPrompt({ target })`** 支持 pane_id
-> 与台账名完整提交（enter+确认）；投喂禁止 raw `herdr agent prompt`（只填充）。L0/L1/L2 均已通过。
+> 另已加固:`spawn` 可省略 `--model`(kind 默认对齐 herdr-orchestrator)、大内容用
+> `--brief-file` 短指针。库级 **`submitPrompt({ target })`** 现在是 canonical transport：
+> per-target lock、版本 profile、baseline-aware lifecycle confirmation 与结构化 fail-closed
+> receipt。投喂禁止 raw `herdr agent prompt`。官方 Herdr 0.7.5 为生产 profile，本地 core
+> fork 不是运行依赖。
 
 ## 1. 为什么要它(问题)
 
@@ -24,6 +26,9 @@ herdr-live 是**底层通用工具**,刻意保持中性、少限制——只做�
 - **不替代 herdr-orchestrator**:不做 task 冻结、accept 门禁、证据 digest、reviewer/verifier 角色链。那是正式验收编排的领域。
 - **不发明新状态机**:agent 生命周期状态直接透传 herdr 的(idle/working/done/blocked)。
 
+`transport_phase` receipt 只描述一次 wrapper 投递的可证明事实，不是新的 Agent/task
+lifecycle，也不代表 Agent 已理解、完成或通过验收。
+
 > 注意:"不在 agent 之间中继消息"是 **agent2agent 项目**的红线(它的命题要求两 agent 经 Bus 直连),**不是 herdr-live 的限制**。对通用工具而言,中继输出、基于输出编排决策都是调用者的正当用法。工具提供能力,消费者定约束。
 
 ## 3. 封装什么(核心 API)
@@ -36,9 +41,9 @@ herdr-live spawn <name> --kind cursor [--model <m>] --cwd <dir>
     # --model 可省略:用 kinds.js 与 herdr-orchestrator 对齐的 defaultModel
 
 herdr-live prompt <name> --text <t> | --file <path> | --brief-file <path>
-    # = agent prompt + settle + enter,再短窗确认进入 working|done|blocked
+    # = exact-target lock + version-aware transport + lifecycle receipt
     # --brief-file:短指针投喂(大内容首选);--file 仍是整段 paste(≠指针)
-    # 禁止返回 {submitted:true, state:idle} 假成功
+    # 只有 lifecycle_observed 成功；not_sent 是唯一可重试相位
 
 herdr-live read <name> [--tail N]
 herdr-live wait <name> --until <state> [--timeout-ms M]
@@ -49,8 +54,13 @@ herdr-live kill <name> | --all
 **关键内建知识**(把踩过的坑固化进工具):
 - **kind→flags + defaultModel**:cursor/claude/codex 的 executor flags 与默认 model 从
   `src/kinds.js` 读,对齐 herdr-orchestrator `config.toml`。
-- **prompt 提交 + 开工确认**:`agent prompt` 只填充;需 `send-keys enter`。settle 只作兜底;
-  成功前必须见到 `working|done|blocked`,否则非 0——杜绝假 submitted。
+- **版本感知提交**：官方 0.7.5 profile 执行 prompt→settle→显式 Enter；
+  core-managed-enter 禁止二次 Enter；unknown fail-closed，不猜测。
+- **receipt + baseline-aware 确认**：记录 exact target、prompt digest、版本、transport phase
+  和提交前后 lifecycle。已有 active state 不能确认新 prompt；post-transport 无法证明时
+  记 `ambiguous`，禁止自动重发。仅 pre-transport `not_sent` 可有界重试。
+- **per-target 合作锁**：按 socket/session + pane 原子串行；仅 owner PID 已消失才回收
+  stale lock，`finally` 释放。它不覆盖手工/raw 输入。
 - **大内容短指针**:整段 paste 软上限 ~2KB;长说明书用 `--brief-file`(agent 自己 Read)。
 - **ID 抽取 / 资源清理**:`deepId` 抠 pane/tab;`kill` 失败保留台账以便重试。
 
@@ -83,10 +93,13 @@ herdr-live scene <scene.json>
 
 - `herdr tab create --cwd <dir> --no-focus --label <l>` → JSON.result.root_pane.{pane_id,tab_id}。
 - `herdr agent start <name> --kind cursor --pane <pid> -- --model cursor-grok-4.5-high --force --trust --add-dir <dir>` → 起可写 cursor agent(argv 实测正确)。
-- `herdr agent prompt <name> <text>` **只填充不提交**;需随后 `herdr agent send-keys <name> enter` 才执行。
-- **填充与 enter 之间有竞态**(herdr-live 落地时实测发现):`agent prompt` 后立刻 `send-keys enter`,enter 可能在填充落定前触发,导致 prompt 滞留输入框不发出(agent 停在 idle)。需在两者之间插入 settle 延时——实测 <1s 偶发滞留、≥1s 稳定提交;封装应默认加 ~1000ms 延时(codex 默认略长)。
-- **假成功**(S12 编排暴露):API 可返回 `submitted:true` 而 agent 仍 `idle`(prompt 滞留框内)。
-  主修复不是无限加大 settle,而是**开工确认** + 大内容改**短指针**(`--brief-file`)。
+- 官方 Herdr 0.7.5 的 `herdr agent prompt <name> <text>` **只填充不提交**；该 profile
+  需要随后 `send-keys enter`。不能把这一事实外推到其他版本，因此由 version profile
+  独占 Enter 决策。
+- **填充与 Enter 之间有竞态**：0.7.5 下立刻 Enter 可能在填充落定前触发。settle 是
+  profile 的 transport 步骤，但不是成功证据。
+- **假成功**(S12 编排暴露)：active/idle 的单点状态不足以确认本次 prompt。主修复是
+  相对 baseline 的 lifecycle 推进 + fail-closed receipt，而不是无限增大 settle。
   L2 证据:`logs/l2-dual-cursor-brief/evidence.json`(双 cursor、无 `--model`、~3.6KB brief)。
 - `herdr agent read <name>` 读终端应**用默认 source**;`--source recent-unwrapped` 实测只回状态栏、几乎为空(那是 busy 签名检测的小窗口,不适合读对话)。回滚窗口有限,长输出会滚掉(判官应以外部权威源如 Bus transcript 为准,不单靠 agent read)。
 - `herdr tab close <tab_id>` 收资源。

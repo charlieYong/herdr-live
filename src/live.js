@@ -3,8 +3,7 @@
 // herdr-live 的五个核心动词：spawn / prompt / read / wait / kill。
 // 每个动词把一段易错的 herdr 底层序列变成语义明确的调用，把踩过的坑固化进来：
 //  - spawn：tab create 拿 pane_id/tab_id + agent start 按 kind 拼对 flags；缺 --model 时用 kind 默认；
-//  - prompt / submitPrompt：agent prompt 后自动补 enter；短窗确认进入 working/done/blocked
-//    （禁止假 submitted）；大内容用 briefFile→短指针，不整段塞输入框；
+//  - prompt / submitPrompt：版本感知的 canonical prompt transport + 结构化 fail-closed receipt；
 //    submitPrompt 的 target 同时支持 herdr-live 台账名与 pane_id（叫醒场景常无台账）；
 //  - wait：轮询 herdr 实时状态到目标态，超时报错；
 //  - read：agent read 取终端，可选只取尾部；
@@ -24,10 +23,17 @@ const {
   KINDS,
 } = require('./kinds');
 const ledger = require('./ledger');
+const receiptMod = require('./receipt');
+const { acquireTargetLock } = require('./target_lock');
+const {
+  resolveVersionProfile,
+  shouldSendEnter,
+  assertTransportAllowed,
+} = require('./version_profile');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 投喂后必须在此时间内离开「未开工」态，否则视为 prompt 未发出。 */
+/** 投喂后必须在此时间内观察到相对 baseline 的生命周期证据，否则 ambiguous。 */
 const DEFAULT_CONFIRM_START_MS = 10000;
 
 /** herdr pane_id 形如 w3:p16 / w3:p3G（workspace:pane）。 */
@@ -112,6 +118,66 @@ function currentState(herdrTarget) {
   }
 }
 
+function snapshotLifecycle(herdrTarget) {
+  try {
+    const rec = herdrMod.agentRecord(herdrTarget);
+    const state = herdrMod.agentState(rec);
+    let seq = null;
+    try {
+      const raw = herdrMod.unwrap(rec.state_change_seq);
+      if (raw != null && raw !== '') seq = Number(raw);
+      if (!Number.isFinite(seq)) seq = null;
+    } catch (e) {
+      seq = null;
+    }
+    return { state, state_change_seq: seq };
+  } catch (e) {
+    return { state: 'unknown', state_change_seq: null };
+  }
+}
+
+const ACTIVE_STATES = new Set(['working', 'done', 'blocked']);
+
+/**
+ * Confirm lifecycle evidence for *this* submission.
+ * An already-working/done/blocked baseline is NOT evidence for the new prompt —
+ * require state_change_seq to advance (or a transition into an active state from
+ * a non-active baseline).
+ */
+async function confirmLifecycle(herdrTarget, baseline, { timeoutMs = DEFAULT_CONFIRM_START_MS, pollMs = 250 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let last = snapshotLifecycle(herdrTarget);
+  const baselineActive = ACTIVE_STATES.has(String(baseline && baseline.state));
+  const baselineSeq =
+    baseline && baseline.state_change_seq != null && Number.isFinite(Number(baseline.state_change_seq))
+      ? Number(baseline.state_change_seq)
+      : null;
+
+  while (Date.now() < deadline) {
+    last = snapshotLifecycle(herdrTarget);
+    const active = ACTIVE_STATES.has(last.state);
+    const seq = last.state_change_seq;
+    let advanced = false;
+    if (baselineSeq != null && seq != null && seq > baselineSeq) {
+      advanced = true;
+    } else if (!baselineActive && active) {
+      // Non-active → active without seq is weak but accepted when seq unavailable.
+      advanced = baselineSeq == null || seq == null ? true : seq > baselineSeq;
+    }
+    if (active && advanced) {
+      return { ...last, confirmed: true };
+    }
+    await sleep(pollMs);
+  }
+  const err = new herdrMod.HerdrError(
+    `prompt 未确认生命周期（${timeoutMs}ms；baseline=${baseline && baseline.state}/seq=${baseline && baseline.state_change_seq}；` +
+      `observed=${last.state}/seq=${last.state_change_seq}）。` +
+      `已 working 的 baseline 不能当作新 prompt 证据；超时后 receipt=ambiguous，禁止自动重发。`
+  );
+  err.observed = last;
+  throw err;
+}
+
 // spawn：起一个 live agent。= tab create（拿 pane_id/tab_id）+ agent start（按 kind 拼 flags）。
 // model 可省略：用 kinds.js 里与 herdr-orchestrator 对齐的 defaultModel。
 // 返回 { name, pane_id, tab_id, kind, model, cwd, state }。
@@ -153,27 +219,6 @@ function spawn(name, { kind, model, cwd, label } = {}) {
 }
 
 /**
- * 投喂后确认 agent 已真正开工（离开「填充失败仍 idle」的假成功）。
- * herdrTarget 可以是台账名或 pane_id（herdr agent get/prompt 均接受）。
- * 命中 working|done|blocked 即视为发出；超时抛错——绝不返回 submitted:true。
- */
-async function confirmStart(herdrTarget, { timeoutMs = DEFAULT_CONFIRM_START_MS, pollMs = 250 } = {}) {
-  const ok = new Set(['working', 'done', 'blocked']);
-  const deadline = Date.now() + timeoutMs;
-  let last = 'unknown';
-  while (Date.now() < deadline) {
-    last = currentState(herdrTarget);
-    if (ok.has(last)) return { name: herdrTarget, state: last, confirmed: true };
-    await sleep(pollMs);
-  }
-  throw new herdrMod.HerdrError(
-    `prompt 未确认开工（${timeoutMs}ms 内未进入 working/done/blocked，当前 ${last}）。` +
-      `常见原因：只调 herdr agent prompt 未 enter、或填充→enter 竞态（加大 --settle-ms / settleMs 或改用 --brief-file）；` +
-      `不要把「仍 idle」当成已投喂成功。`
-  );
-}
-
-/**
  * 校验将要 paste 进输入框的正文体积。超软上限则拒绝（可用 forcePaste 覆盖）。
  * @param {string} text
  * @param {{ forcePaste?: boolean }} [opts]
@@ -190,25 +235,26 @@ function assertPasteSize(text, opts = {}) {
   );
 }
 
+function finalizeReceipt(receipt, opts = {}) {
+  if (opts.receiptPath) {
+    receiptMod.persistReceipt(receipt, opts.receiptPath);
+    receipt.evidence = {
+      ...receipt.evidence,
+      receipt_path: path.resolve(String(opts.receiptPath)),
+    };
+  } else if (opts.persistReceipt) {
+    const p = receiptMod.defaultReceiptPath(receipt.submission_id);
+    receiptMod.persistReceipt(receipt, p);
+    receipt.evidence = { ...receipt.evidence, receipt_path: p };
+  }
+  return receipt;
+}
+
 /**
- * 库级完整投喂：prompt → settle → send-keys enter → 短窗确认 working|done|blocked。
- * **禁止**只填框不 enter；确认失败抛错（绝不返回假 submitted）。
+ * 库级完整投喂：版本感知 transport + per-target lock + 结构化 receipt。
+ * 仅 transport_phase=not_sent 可自动重试；任何 post-transport 不确定结果为 ambiguous。
  *
- * @param {object} opts
- * @param {string} opts.target  pane_id（如 w3:p16）或 herdr-live/herdr agent 名
- * @param {string} [opts.text]  整段 paste 正文
- * @param {string} [opts.file]  读文件再整段 paste（≠ briefFile）
- * @param {string} [opts.briefFile] 短指针投喂
- * @param {string} [opts.briefStyle] dispatch|answer
- * @param {number} [opts.settleMs]
- * @param {number} [opts.confirmStartMs]
- * @param {boolean} [opts.skipConfirmStart]
- * @param {boolean} [opts.forcePaste]
- * @param {string|string[]} [opts.waitUntil]
- * @param {number} [opts.timeoutMs]
- * @param {string} [opts.kind]  pane_id 路径可显式给 kind（影响默认 settle）
- * @param {string} [opts.cwd]
- * @param {boolean} [opts.asPaneId] 强制按 pane_id 解析
+ * @returns {Promise<object>} versioned receipt（兼兼容旧 submitted/confirmed 字段）
  */
 async function submitPrompt(opts = {}) {
   const {
@@ -226,78 +272,210 @@ async function submitPrompt(opts = {}) {
     kind: kindOpt,
     cwd: cwdOpt,
     asPaneId = false,
+    submissionId = null,
+    receiptPath = null,
+    persistReceipt = false,
+    forceProfile = null,
+    versionText = null,
+    lockRoot = null,
+    skipLock = false,
   } = opts;
 
-  const resolved = resolveSubmitTarget(target, {
-    kind: kindOpt,
-    cwd: cwdOpt,
-    asPaneId,
+  let receipt = receiptMod.createReceipt({
+    submission_id: submissionId || undefined,
   });
-  const { herdrTarget, kind, cwd } = resolved;
+  let lockHandle = null;
+  let transportStarted = false;
 
-  let body = text;
-  if (file && body == null) {
-    const absFile = path.resolve(String(file));
-    if (!fs.existsSync(absFile)) {
-      throw new herdrMod.HerdrError(`file 不存在：${absFile}`);
-    }
-    body = fs.readFileSync(absFile, 'utf8');
-  }
-
-  let transport = 'paste';
-  if (briefFile) {
-    const abs = path.resolve(String(briefFile));
-    if (!fs.existsSync(abs)) {
-      throw new herdrMod.HerdrError(`brief-file 不存在：${abs}`);
-    }
-    body = buildBriefPointer(abs, {
-      cwd: cwd || undefined,
-      style: briefStyle || 'dispatch',
-    });
-    transport = briefStyle === 'answer' ? 'brief-pointer-answer' : 'brief-pointer';
-  } else if (body == null) {
-    throw new herdrMod.HerdrError(
-      'submitPrompt 需要 text / file / briefFile（等同 CLI --text / --file / --brief-file）'
-    );
-  } else {
-    assertPasteSize(body, { forcePaste });
-  }
-
-  const settle =
-    settleMs !== undefined && settleMs !== null
-      ? Number(settleMs)
-      : defaultSettleMs(kind);
-
-  // 完整提交序列——与 CLI `herdr-live prompt` 同一实现；pane_id 亦走此路径。
-  herdrMod.herdr(['agent', 'prompt', herdrTarget, body]);
-  if (submitNeedsEnter(kind)) {
-    if (settle > 0) await sleep(settle);
-    herdrMod.herdr(['agent', 'send-keys', herdrTarget, 'enter']);
-  }
-
-  let state;
-  if (!skipConfirmStart) {
-    const conf = await confirmStart(herdrTarget, { timeoutMs: confirmStartMs });
-    state = conf.state;
-  } else {
-    state = currentState(herdrTarget);
-  }
-
-  if (waitUntil) {
-    return wait(herdrTarget, { until: waitUntil, timeoutMs });
-  }
-  return {
-    name: resolved.name || herdrTarget,
-    target: herdrTarget,
-    pane_id: resolved.pane_id || null,
-    via: resolved.via,
-    submitted: true,
-    confirmed: !skipConfirmStart,
-    state,
-    transport,
-    settleMs: settle,
-    promptBytes: Buffer.byteLength(String(body), 'utf8'),
+  const failNotSent = (error) => {
+    receiptMod.setPhase(receipt, 'not_sent', { error: String(error && error.message ? error.message : error) });
+    finalizeReceipt(receipt, { receiptPath, persistReceipt });
+    const err = error instanceof Error ? error : new herdrMod.HerdrError(String(error));
+    err.receipt = receipt;
+    err.transport_phase = 'not_sent';
+    throw err;
   };
+
+  const failAmbiguous = (error, observed) => {
+    receiptMod.setPhase(receipt, 'ambiguous', {
+      error: String(error && error.message ? error.message : error),
+      observed: observed || receipt.observed,
+    });
+    finalizeReceipt(receipt, { receiptPath, persistReceipt });
+    const err = new herdrMod.HerdrError(
+      `transport ambiguous（禁止自动重发）：${error && error.message ? error.message : error}`
+    );
+    err.receipt = receipt;
+    err.transport_phase = 'ambiguous';
+    throw err;
+  };
+
+  try {
+    let resolved;
+    try {
+      resolved = resolveSubmitTarget(target, {
+        kind: kindOpt,
+        cwd: cwdOpt,
+        asPaneId,
+      });
+    } catch (e) {
+      return failNotSent(e);
+    }
+
+    const { herdrTarget, kind, cwd } = resolved;
+    receipt.target = {
+      name: resolved.name,
+      pane_id: resolved.pane_id,
+      kind: kind || null,
+      via: resolved.via,
+      herdr_target: herdrTarget,
+    };
+
+    let body = text;
+    try {
+      if (file && body == null) {
+        const absFile = path.resolve(String(file));
+        if (!fs.existsSync(absFile)) {
+          throw new herdrMod.HerdrError(`file 不存在：${absFile}`);
+        }
+        body = fs.readFileSync(absFile, 'utf8');
+      }
+
+      let transport = 'paste';
+      if (briefFile) {
+        const abs = path.resolve(String(briefFile));
+        if (!fs.existsSync(abs)) {
+          throw new herdrMod.HerdrError(`brief-file 不存在：${abs}`);
+        }
+        body = buildBriefPointer(abs, {
+          cwd: cwd || undefined,
+          style: briefStyle || 'dispatch',
+        });
+        transport = briefStyle === 'answer' ? 'brief-pointer-answer' : 'brief-pointer';
+      } else if (body == null) {
+        throw new herdrMod.HerdrError(
+          'submitPrompt 需要 text / file / briefFile（等同 CLI --text / --file / --brief-file）'
+        );
+      } else {
+        assertPasteSize(body, { forcePaste });
+      }
+      receipt.transport = transport;
+      receipt.promptBytes = Buffer.byteLength(String(body), 'utf8');
+      receipt.prompt_digest = receiptMod.promptDigest(body);
+    } catch (e) {
+      return failNotSent(e);
+    }
+
+    let profile;
+    try {
+      profile = resolveVersionProfile({ forceProfile, versionText });
+      assertTransportAllowed(profile);
+    } catch (e) {
+      return failNotSent(e);
+    }
+    receipt.herdr = {
+      version: profile.versionText,
+      profile: profile.id,
+      enter_policy: profile.enterPolicy,
+      forced: Boolean(profile.forced),
+    };
+
+    // Official explicit-enter profile alone decides Enter. Kind submitNeedsEnter is
+    // informational (settle defaults / docs) and must never suppress a required Enter.
+    const profileWantsEnter = shouldSendEnter(profile);
+    const sendEnter = profileWantsEnter;
+    receipt.evidence.kind_submit_needs_enter = submitNeedsEnter(kind);
+
+    const settle =
+      settleMs !== undefined && settleMs !== null
+        ? Number(settleMs)
+        : defaultSettleMs(kind);
+    receipt.settleMs = settle;
+
+    if (!skipLock) {
+      try {
+        lockHandle = acquireTargetLock(resolved.pane_id || herdrTarget, {
+          lockRoot: lockRoot || undefined,
+          owner: {
+            submission_id: receipt.submission_id,
+            herdr_target: herdrTarget,
+          },
+        });
+        receipt.evidence.lock_path = lockHandle.path;
+      } catch (e) {
+        return failNotSent(e);
+      }
+    }
+
+    receipt.baseline = snapshotLifecycle(herdrTarget);
+    receipt.observed = { ...receipt.baseline };
+
+    // --- transport begins: once agent prompt is invoked, failures are ambiguous ---
+    transportStarted = true;
+    try {
+      herdrMod.herdr(['agent', 'prompt', herdrTarget, body]);
+      receiptMod.setPhase(receipt, 'prompt_filled', {
+        observed: snapshotLifecycle(herdrTarget),
+      });
+    } catch (e) {
+      return failAmbiguous(e);
+    }
+
+    if (sendEnter) {
+      try {
+        if (settle > 0) await sleep(settle);
+        herdrMod.herdr(['agent', 'send-keys', herdrTarget, 'enter']);
+        receiptMod.setPhase(receipt, 'enter_sent', {
+          observed: snapshotLifecycle(herdrTarget),
+        });
+      } catch (e) {
+        return failAmbiguous(e);
+      }
+    } else {
+      // core-managed-enter: prompt fill is expected to schedule Enter; mark enter_sent
+      // as "delegated" without a second Enter.
+      receipt.evidence.enter_delegated_to_core = true;
+      receiptMod.setPhase(receipt, 'enter_sent', {
+        observed: snapshotLifecycle(herdrTarget),
+      });
+    }
+
+    if (!skipConfirmStart) {
+      try {
+        const conf = await confirmLifecycle(herdrTarget, receipt.baseline, {
+          timeoutMs: confirmStartMs,
+        });
+        receiptMod.setPhase(receipt, 'lifecycle_observed', {
+          observed: { state: conf.state, state_change_seq: conf.state_change_seq },
+        });
+      } catch (e) {
+        return failAmbiguous(e, e.observed || snapshotLifecycle(herdrTarget));
+      }
+    } else {
+      receipt.observed = snapshotLifecycle(herdrTarget);
+      receipt.state = receipt.observed.state;
+      receipt.submitted = true;
+      receipt.confirmed = false;
+      receipt.timestamps.finished_at = new Date().toISOString();
+    }
+
+    finalizeReceipt(receipt, { receiptPath, persistReceipt });
+
+    if (waitUntil) {
+      const waited = await wait(herdrTarget, { until: waitUntil, timeoutMs });
+      receipt.evidence.wait = waited;
+      return receipt;
+    }
+    return receipt;
+  } finally {
+    if (lockHandle) {
+      try {
+        lockHandle.release();
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
 }
 
 // prompt：兼容五动词签名；内部一律走 submitPrompt（禁止双份逻辑）。
@@ -403,7 +581,19 @@ module.exports = {
   list,
   kill,
   killAll,
-  confirmStart,
+  confirmLifecycle,
   assertPasteSize,
+  snapshotLifecycle,
   DEFAULT_CONFIRM_START_MS,
+  // Hardened: legacy callers must pass a real baseline. A fake idle baseline would
+  // false-confirm an already-working target when seq is unavailable.
+  confirmStart: async (herdrTarget, opts = {}) => {
+    if (!opts || opts.baseline == null || typeof opts.baseline !== 'object') {
+      throw new herdrMod.HerdrError(
+        'confirmStart 需要真实 baseline（{state, state_change_seq}）；' +
+          '禁止用假 idle baseline。请改用 confirmLifecycle(target, baseline, opts)。'
+      );
+    }
+    return confirmLifecycle(herdrTarget, opts.baseline, opts);
+  },
 };

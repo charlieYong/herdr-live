@@ -2,7 +2,9 @@
 
 > 五个动词(见 [`README.md`](./README.md))告诉你**能做什么**;本文告诉你**什么时候该想起用它**。
 > 每个场景附一条"该用 herdr-live 而不是 X"的边界,防止误用。
-> **投喂红线**：一律 `herdr-live prompt` / `submitPrompt`；raw `herdr agent prompt` = 只填充不提交（见 README 开篇）。
+> **投喂红线**：一律 `herdr-live prompt` / `submitPrompt`；官方 Herdr 0.7.5 的 raw
+> `herdr agent prompt` 只填充不提交，其它版本也必须由 transport profile 决定，
+> 禁止调用方自行猜测（见 README 开篇）。
 
 ## 何时用 herdr-live(一句话触发锚)
 

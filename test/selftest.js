@@ -206,7 +206,7 @@ async function checkAsync(name, fn) {
 }
 
 (async () => {
-  await checkAsync('prompt：假 idle 抛错（非假 submitted）', async () => {
+  await checkAsync('prompt：假 idle 落 ambiguous（非假 submitted+confirmed）', async () => {
     ledger.put('promptIdle', {
       pane_id: 'w1:p1', tab_id: 'w1:t1', kind: 'cursor', model: 'm', cwd: '/c',
     });
@@ -215,17 +215,27 @@ async function checkAsync(name, fn) {
       calls.push(args);
       return 'ok';
     };
-    herdrMod.agentRecord = () => ({ name: 'promptIdle' });
+    herdrMod.agentRecord = () => ({ name: 'promptIdle', agent_status: 'idle', state_change_seq: 1 });
     herdrMod.agentState = () => 'idle';
     try {
       let threw = false;
+      let receipt = null;
       try {
-        await live.prompt('promptIdle', 'hi', { confirmStartMs: 400, settleMs: 0 });
+        await live.prompt('promptIdle', 'hi', {
+          confirmStartMs: 400,
+          settleMs: 0,
+          skipLock: true,
+          forceProfile: 'official-0.7.5',
+        });
       } catch (e) {
         threw = true;
-        assert.ok(/未确认开工/.test(e.message), e.message);
+        receipt = e.receipt;
+        assert.ok(/ambiguous/.test(e.message), e.message);
       }
-      assert.ok(threw, '应抛错，不得返回 submitted:true');
+      assert.ok(threw, '应抛错，不得返回 confirmed');
+      assert.ok(receipt, '必须保留 receipt');
+      assert.strictEqual(receipt.transport_phase, 'ambiguous');
+      assert.strictEqual(receipt.confirmed, false);
       assert.ok(calls.some((a) => a[0] === 'agent' && a[1] === 'prompt'));
       assert.ok(calls.some((a) => a[0] === 'agent' && a[1] === 'send-keys'));
     } finally {
@@ -235,19 +245,32 @@ async function checkAsync(name, fn) {
     }
   });
 
-  await checkAsync('prompt：见 working 则确认成功', async () => {
+  await checkAsync('prompt：见 working 则 lifecycle_observed', async () => {
     ledger.put('promptOk', {
       pane_id: 'w1:p2', tab_id: 'w1:t2', kind: 'claude', model: 'm', cwd: '/work',
     });
     herdrMod.herdr = () => 'ok';
-    herdrMod.agentRecord = () => ({ name: 'promptOk' });
-    herdrMod.agentState = () => 'working';
+    let seq = 1;
+    herdrMod.agentRecord = () => {
+      const status = seq === 1 ? 'idle' : 'working';
+      const rec = { name: 'promptOk', agent_status: status, state_change_seq: seq };
+      if (seq === 1) seq = 2;
+      return rec;
+    };
+    herdrMod.agentState = (rec) => (rec && rec.agent_status) || 'working';
     try {
-      const res = await live.prompt('promptOk', 'hi', { confirmStartMs: 2000, settleMs: 0 });
+      const res = await live.prompt('promptOk', 'hi', {
+        confirmStartMs: 2000,
+        settleMs: 0,
+        skipLock: true,
+        forceProfile: 'official-0.7.5',
+      });
+      assert.strictEqual(res.transport_phase, 'lifecycle_observed');
       assert.strictEqual(res.submitted, true);
       assert.strictEqual(res.confirmed, true);
-      assert.strictEqual(res.state, 'working');
+      assert.strictEqual(res.observed.state, 'working');
       assert.strictEqual(res.transport, 'paste');
+      assert.ok(res.prompt_digest.startsWith('sha256:'));
     } finally {
       herdrMod.herdr = realHerdr;
       herdrMod.agentRecord = realAgentRecord;
@@ -266,15 +289,26 @@ async function checkAsync(name, fn) {
       if (args[0] === 'agent' && args[1] === 'prompt') promptedBody = args[3];
       return 'ok';
     };
-    herdrMod.agentRecord = () => ({ name: 'promptBrief' });
-    herdrMod.agentState = () => 'working';
+    let n = 0;
+    herdrMod.agentRecord = () => {
+      n += 1;
+      return {
+        name: 'promptBrief',
+        agent_status: n === 1 ? 'idle' : 'working',
+        state_change_seq: n,
+      };
+    };
+    herdrMod.agentState = (rec) => (rec && rec.agent_status) || 'working';
     try {
       const res = await live.prompt('promptBrief', null, {
         briefFile: briefPath,
         confirmStartMs: 2000,
         settleMs: 0,
+        skipLock: true,
+        forceProfile: 'official-0.7.5',
       });
       assert.strictEqual(res.transport, 'brief-pointer');
+      assert.strictEqual(res.transport_phase, 'lifecycle_observed');
       assert.ok(promptedBody.includes(briefPath));
       assert.ok(promptedBody.includes('请完整阅读并严格按此文件执行'));
       assert.ok(!promptedBody.includes('xxxxx'), '不应整段 paste 大文件');
@@ -297,14 +331,24 @@ async function checkAsync(name, fn) {
       if (args[0] === 'agent' && args[1] === 'prompt') promptedBody = args[3];
       return 'ok';
     };
-    herdrMod.agentRecord = () => ({ name: 'promptAnswer' });
-    herdrMod.agentState = () => 'working';
+    let n = 0;
+    herdrMod.agentRecord = () => {
+      n += 1;
+      return {
+        name: 'promptAnswer',
+        agent_status: n === 1 ? 'idle' : 'working',
+        state_change_seq: n,
+      };
+    };
+    herdrMod.agentState = (rec) => (rec && rec.agent_status) || 'working';
     try {
       const res = await live.prompt('promptAnswer', null, {
         briefFile: briefPath,
         briefStyle: 'answer',
         confirmStartMs: 2000,
         settleMs: 0,
+        skipLock: true,
+        forceProfile: 'official-0.7.5',
       });
       assert.strictEqual(res.transport, 'brief-pointer-answer');
       assert.ok(promptedBody.includes('人已答复'));
@@ -346,10 +390,19 @@ async function checkAsync(name, fn) {
       calls.push(args);
       return 'ok';
     };
-    herdrMod.agentRecord = (t) => ({
-      name: t, pane_id: 'w9:p42', agent: 'cursor', agent_status: 'working', cwd: '/wake',
-    });
-    herdrMod.agentState = () => 'working';
+    let n = 0;
+    herdrMod.agentRecord = (t) => {
+      n += 1;
+      return {
+        name: t,
+        pane_id: 'w9:p42',
+        agent: 'cursor',
+        agent_status: n === 1 ? 'idle' : 'working',
+        state_change_seq: n,
+        cwd: '/wake',
+      };
+    };
+    herdrMod.agentState = (rec) => (rec && rec.agent_status) || 'working';
     try {
       // 刻意不写 ledger——叫醒场景常见
       assert.strictEqual(ledger.get('w9:p42'), null);
@@ -358,11 +411,14 @@ async function checkAsync(name, fn) {
         text: 'wake brief',
         confirmStartMs: 2000,
         settleMs: 0,
+        skipLock: true,
+        forceProfile: 'official-0.7.5',
       });
       assert.strictEqual(res.submitted, true);
       assert.strictEqual(res.confirmed, true);
-      assert.strictEqual(res.via, 'pane_id');
-      assert.strictEqual(res.target, 'w9:p42');
+      assert.strictEqual(res.transport_phase, 'lifecycle_observed');
+      assert.strictEqual(res.target.via, 'pane_id');
+      assert.strictEqual(res.target.herdr_target, 'w9:p42');
       assert.ok(calls.some((a) => a[0] === 'agent' && a[1] === 'prompt' && a[2] === 'w9:p42'));
       assert.ok(
         calls.some((a) => a[0] === 'agent' && a[1] === 'send-keys' && a[2] === 'w9:p42' && a[3] === 'enter'),
@@ -375,31 +431,256 @@ async function checkAsync(name, fn) {
     }
   });
 
-  await checkAsync('submitPrompt：确认失败抛错（禁止假 submitted）', async () => {
+  await checkAsync('submitPrompt：确认失败 → ambiguous receipt（禁止假 submitted confirmed）', async () => {
     const calls = [];
     herdrMod.herdr = (args) => {
       calls.push(args);
       return 'ok';
     };
-    herdrMod.agentRecord = () => ({ pane_id: 'w9:p43', agent: 'cursor' });
+    herdrMod.agentRecord = () => ({
+      pane_id: 'w9:p43', agent: 'cursor', agent_status: 'idle', state_change_seq: 1,
+    });
     herdrMod.agentState = () => 'idle';
     try {
       let threw = false;
+      let receipt = null;
       try {
         await live.submitPrompt({
           target: 'w9:p43',
           text: 'hi',
           confirmStartMs: 400,
           settleMs: 0,
+          skipLock: true,
+          forceProfile: 'official-0.7.5',
         });
       } catch (e) {
         threw = true;
-        assert.ok(/未确认开工/.test(e.message), e.message);
+        receipt = e.receipt;
+        assert.ok(/ambiguous/.test(e.message), e.message);
       }
-      assert.ok(threw, '应抛错，不得返回 submitted:true');
+      assert.ok(threw, '应抛错，不得返回 confirmed');
+      assert.strictEqual(receipt.transport_phase, 'ambiguous');
       assert.ok(calls.some((a) => a[1] === 'send-keys' && a[3] === 'enter'));
     } finally {
       herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  // --- wrapper-only transport receipts / profile / lock ---
+  const versionProfile = require('../src/version_profile');
+  const targetLock = require('../src/target_lock');
+  const receiptMod = require('../src/receipt');
+
+  check('version profile：0.7.5 → explicit-enter', () => {
+    assert.strictEqual(versionProfile.classifyVersionText('herdr 0.7.5'), 'official-0.7.5');
+    const p = versionProfile.resolveVersionProfile({
+      versionText: 'herdr 0.7.5',
+    });
+    assert.strictEqual(p.enterPolicy, 'explicit-enter');
+    assert.ok(versionProfile.shouldSendEnter(p));
+  });
+
+  check('version profile：core-managed-enter 禁止二次 Enter', () => {
+    const p = versionProfile.resolveVersionProfile({ forceProfile: 'core-managed-enter' });
+    assert.strictEqual(p.enterPolicy, 'no-second-enter');
+    assert.strictEqual(versionProfile.shouldSendEnter(p), false);
+  });
+
+  check('version profile：unknown fail-closed', () => {
+    const p = versionProfile.resolveVersionProfile({ versionText: 'herdr 9.9.9-nightly' });
+    assert.strictEqual(p.id, 'unknown');
+    assert.throws(() => versionProfile.assertTransportAllowed(p), /未识别/);
+  });
+
+  await checkAsync('submitPrompt：core-managed-enter 不发第二次 Enter', async () => {
+    const calls = [];
+    herdrMod.herdr = (args) => {
+      calls.push(args);
+      return 'ok';
+    };
+    let n = 0;
+    herdrMod.agentRecord = () => {
+      n += 1;
+      return { pane_id: 'w1:p50', agent_status: n === 1 ? 'idle' : 'working', state_change_seq: n };
+    };
+    herdrMod.agentState = (rec) => (rec && rec.agent_status) || 'working';
+    try {
+      const res = await live.submitPrompt({
+        target: 'w1:p50',
+        text: 'hi',
+        kind: 'cursor',
+        settleMs: 0,
+        confirmStartMs: 2000,
+        skipLock: true,
+        forceProfile: 'core-managed-enter',
+      });
+      assert.strictEqual(res.transport_phase, 'lifecycle_observed');
+      assert.ok(calls.some((a) => a[1] === 'prompt'));
+      assert.ok(!calls.some((a) => a[1] === 'send-keys'), '禁止二次 Enter');
+      assert.strictEqual(res.evidence.enter_delegated_to_core, true);
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('submitPrompt：已 working baseline 不能假确认', async () => {
+    herdrMod.herdr = () => 'ok';
+    herdrMod.agentRecord = () => ({
+      pane_id: 'w1:p51', agent_status: 'working', state_change_seq: 9,
+    });
+    herdrMod.agentState = () => 'working';
+    try {
+      let receipt = null;
+      try {
+        await live.submitPrompt({
+          target: 'w1:p51',
+          text: 'hi',
+          kind: 'cursor',
+          settleMs: 0,
+          confirmStartMs: 400,
+          skipLock: true,
+          forceProfile: 'official-0.7.5',
+        });
+      } catch (e) {
+        receipt = e.receipt;
+      }
+      assert.ok(receipt);
+      assert.strictEqual(receipt.transport_phase, 'ambiguous');
+      assert.strictEqual(receipt.baseline.state, 'working');
+      assert.strictEqual(receipt.baseline.state_change_seq, 9);
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('submitPrompt：pre-transport 失败 → not_sent', async () => {
+    try {
+      let receipt = null;
+      try {
+        await live.submitPrompt({
+          target: 'w1:p52',
+          // missing text/file/brief → before transport
+          settleMs: 0,
+          skipLock: true,
+          forceProfile: 'official-0.7.5',
+        });
+      } catch (e) {
+        receipt = e.receipt;
+        assert.strictEqual(e.transport_phase, 'not_sent');
+      }
+      assert.ok(receipt);
+      assert.strictEqual(receipt.transport_phase, 'not_sent');
+      assert.ok(receiptMod.mayRetry(receipt));
+    } finally {
+      herdrMod.herdr = realHerdr;
+    }
+  });
+
+  check('receipt：仅 not_sent 可 retry；persist round-trip', () => {
+    const r = receiptMod.createReceipt({ submission_id: 't:a:bootstrap' });
+    assert.strictEqual(r.transport_phase, 'not_sent');
+    assert.ok(receiptMod.mayRetry(r));
+    receiptMod.setPhase(r, 'prompt_filled');
+    assert.ok(!receiptMod.mayRetry(r));
+    receiptMod.setPhase(r, 'ambiguous');
+    assert.ok(!receiptMod.mayRetry(r));
+    const p = path.join(tmpHome, 'receipt-roundtrip.json');
+    receiptMod.persistReceipt(r, p);
+    const loaded = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.strictEqual(loaded.submission_id, 't:a:bootstrap');
+    assert.strictEqual(loaded.transport_phase, 'ambiguous');
+    const cleaned = receiptMod.cleanupReceipts({
+      root: tmpHome,
+      maxAgeMs: -1,
+      maxFiles: 0,
+    });
+    assert.ok(cleaned.removed >= 1);
+  });
+
+  check('target lock：原子获取 + finally 释放 + 仅 PID gone 可回收', () => {
+    const lockDir = path.join(tmpHome, 'locks');
+    const first = targetLock.acquireTargetLock('w1:p99', { lockRoot: lockDir, staleMs: 0 });
+    assert.ok(fs.existsSync(first.path));
+    assert.throws(
+      () => targetLock.acquireTargetLock('w1:p99', { lockRoot: lockDir, staleMs: 0 }),
+      /lock held/
+    );
+    first.release();
+    assert.ok(!fs.existsSync(first.path));
+
+    // Stale file with dead PID
+    const info = targetLock.lockPath('w1:p98', lockDir);
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(
+      info.path,
+      JSON.stringify({ pid: 999999999, created_ms: Date.now() - 1000, pane_id: 'w1:p98' })
+    );
+    const reclaimed = targetLock.acquireTargetLock('w1:p98', { lockRoot: lockDir, staleMs: 0 });
+    assert.ok(fs.existsSync(reclaimed.path));
+    reclaimed.release();
+  });
+
+  await checkAsync('explicit-enter：kind submitNeedsEnter=false 不能压制 Enter', async () => {
+    const kinds = require('../src/kinds');
+    const orig = kinds.KINDS.cursor.submitNeedsEnter;
+    kinds.KINDS.cursor.submitNeedsEnter = false;
+    const calls = [];
+    herdrMod.herdr = (args) => { calls.push(args); return 'ok'; };
+    let n = 0;
+    herdrMod.agentRecord = () => {
+      n += 1;
+      return { pane_id: 'w1:p60', agent_status: n === 1 ? 'idle' : 'working', state_change_seq: n };
+    };
+    herdrMod.agentState = (rec) => (rec && rec.agent_status) || 'working';
+    try {
+      await live.submitPrompt({
+        target: 'w1:p60',
+        text: 'hi',
+        kind: 'cursor',
+        settleMs: 0,
+        confirmStartMs: 2000,
+        skipLock: true,
+        forceProfile: 'official-0.7.5',
+      });
+      assert.ok(
+        calls.some((a) => a[1] === 'send-keys' && a[3] === 'enter'),
+        '0.7.5 profile 必须 Enter，不受 kind 标志压制'
+      );
+    } finally {
+      kinds.KINDS.cursor.submitNeedsEnter = orig;
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('confirmStart：拒绝假 idle baseline（已 working 不可假确认）', async () => {
+    herdrMod.agentRecord = () => ({
+      pane_id: 'w1:p61', agent_status: 'working', state_change_seq: 9,
+    });
+    herdrMod.agentState = () => 'working';
+    try {
+      await assert.rejects(
+        () => live.confirmStart('w1:p61', { confirmStartMs: 200 }),
+        /需要真实 baseline/
+      );
+      let threw = false;
+      try {
+        await live.confirmStart('w1:p61', {
+          baseline: { state: 'working', state_change_seq: 9 },
+          confirmStartMs: 300,
+        });
+      } catch (e) {
+        threw = true;
+      }
+      assert.ok(threw, '真实 working baseline 不得假确认');
+    } finally {
       herdrMod.agentRecord = realAgentRecord;
       herdrMod.agentState = realAgentState;
     }

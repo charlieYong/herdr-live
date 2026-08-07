@@ -8,7 +8,10 @@
     ".": "./src/live.js",
     "./live": "./src/live.js",
     "./herdr": "./src/herdr.js",
-    "./kinds": "./src/kinds.js"
+    "./kinds": "./src/kinds.js",
+    "./receipt": "./src/receipt.js",
+    "./target_lock": "./src/target_lock.js",
+    "./version_profile": "./src/version_profile.js"
   },
   "bin": {
     "herdr-live": "bin/herdr-live.js"
