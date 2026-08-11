@@ -175,10 +175,11 @@ async function main() {
     evidence.error = String(e && e.message ? e.message : e);
     console.error('[l2] error:', evidence.error);
   } finally {
+    // Teardown must use force: default kill only allows idle/done and would leave orphans.
     const kills = [];
     for (const name of [A, B]) {
       try {
-        kills.push(live.kill(name));
+        kills.push(live.kill(name, { force: true }));
       } catch (e) {
         kills.push({ name, error: String(e.message || e) });
       }

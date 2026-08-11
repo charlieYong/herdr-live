@@ -8,6 +8,7 @@
 const live = require('../src/live');
 const { runScene } = require('../src/scene');
 const receiptMod = require('../src/receipt');
+const doctorMod = require('../src/doctor');
 
 // 极简 flag 解析：--k v / --k=v / --flag（布尔）。位置参数进 _[]。
 function parseArgs(argv) {
@@ -62,11 +63,25 @@ const USAGE = `herdr-live — 通用多 agent live 编排
   herdr-live read <name> [--tail <N>]
   herdr-live wait <name> [--until <state>[,<state>]] [--timeout-ms <n>] [--poll-ms <n>]
   herdr-live list
-  herdr-live kill <name> | --all
+  herdr-live kill <name> | --all [--force]
+    # 默认仅关闭 idle/done；working/blocked/unknown/gone 先保护，检查后才能 --force
+  herdr-live doctor [--kind <k>] [--model <m>]
+  herdr-live doctor --live --kind <cursor|claude|codex> [--model <m>]
+      [--timeout-ms <n>] [--cwd <scratch>] [--confirm-start-ms <n>]
+    # advisory：local_preflight vs live_probe 分开报告；PATH 成功 ≠ live 成功
+    # 无 --live：零 spawn/远程/model 调用；live_probe.status=not_requested
+    # 有 --live：精确 kind/model → spawn+submitPrompt 探针；须 lifecycle + 派生 marker
+    # 仅清理本探针名（guarded kill，从不 auto-force / kill --all）；cleanup 单独报告
+    # 公开 JSON 仅 digest（probe_token_digest/expected_marker_digest），无原始 token/marker
+    # 非 promotion 门禁；marker 须为 baseline 同窗口单调后缀证明
   herdr-live scene <scene.json>
 
 状态透传 herdr：idle / working / done / blocked。
-Receipt phases：not_sent | prompt_filled | enter_sent | lifecycle_observed | ambiguous。`;
+Receipt phases：not_sent | prompt_filled | enter_sent | lifecycle_observed | ambiguous。
+Doctor error_code（非穷尽）：unsupported_kind|unsupported_model|executable_unavailable|
+  herdr_unavailable|spawn_failed|ambiguous_transport|timeout|lifecycle_without_token|
+  stale_preexisting_token|stale_output_ambiguous|auth_or_api_failure|cleanup_failed|
+  cleanup_guarded|live_probe_failed|kind_required_for_live|…`;
 
 async function main() {
   const [verb, ...rest] = process.argv.slice(2);
@@ -161,11 +176,16 @@ async function main() {
     }
     case 'kill': {
       if (args.all) {
-        print(live.killAll());
+        const res = live.killAll({ force: Boolean(args.force) });
+        print(res);
+        // guarded / close failure must be visible to shell callers (JSON alone is easy to miss).
+        if (res.some((r) => !r.closed)) process.exitCode = 2;
       } else {
         const name = args._[0];
         if (!name) fail('kill 需要 <name> 或 --all');
-        print(live.kill(name));
+        const res = live.kill(name, { force: Boolean(args.force) });
+        print(res);
+        if (!res.closed) process.exitCode = 2;
       }
       break;
     }
@@ -181,6 +201,27 @@ async function main() {
         maxAgeMs: args['max-age-ms'] != null ? Number(args['max-age-ms']) : undefined,
         maxFiles: args['max-files'] != null ? Number(args['max-files']) : undefined,
       }));
+      break;
+    }
+    case 'doctor': {
+      try {
+        const res = await doctorMod.doctor({
+          live: Boolean(args.live),
+          kind: args.kind || undefined,
+          model: args.model || undefined,
+          timeoutMs: args['timeout-ms'] != null ? Number(args['timeout-ms']) : undefined,
+          confirmStartMs: args['confirm-start-ms'] != null
+            ? Number(args['confirm-start-ms'])
+            : undefined,
+          settleMs: args['settle-ms'] != null ? Number(args['settle-ms']) : undefined,
+          cwd: args.cwd || undefined,
+          forceProfile: args['transport-profile'] || undefined,
+        });
+        print(res);
+        if (!res.ok) process.exitCode = 1;
+      } catch (e) {
+        fail(e && e.message ? e.message : String(e));
+      }
       break;
     }
     default:

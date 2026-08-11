@@ -45,6 +45,7 @@
 herdr-live spawn <name> --kind <cursor|claude|codex> [--model <m>] [--cwd <dir>] [--label <l>]
     # = tab create(拿 pane_id/tab_id)+ agent start(按 kind 拼对 executor flags)
     # --model 可省略：用 kinds.js 与 herdr-orchestrator 对齐的 defaultModel
+    # 创建 tab 前先检查 harness binary；Codex 禁用会话内自更新
     # 返回 { name, pane_id, tab_id, kind, model, cwd, state }
 
 herdr-live prompt <name|pane_id> --text <t> | --file <path> | --brief-file <path>
@@ -66,9 +67,90 @@ herdr-live wait <name> [--until <s>[,<s>]] [--timeout-ms <n>] [--poll-ms <n>]
     # 轮询 herdr 实时状态到目标态(默认 idle,done),超时报错
 
 herdr-live list                 # 本工具起过的 live agents + herdr 实时状态
-herdr-live kill <name> | --all  # 关 tab 收资源,清台账
+herdr-live kill <name> | --all [--force]  # 安全回收 tab 与台账
+    # 默认只关闭 idle/done；working/blocked/unknown/gone 会保护并要求先检查。
+    # 确认无更新、安装、迁移、上传等关键操作后才能显式 --force。
+    # 未关闭成功（含 guarded）时非零退出，stdout 仍打印结构化结果。
     # 只有确认关闭成功(或 tab 本就不存在)才删台账条目;关闭失败保留条目,
     # 以便 kill --all 重试回收——避免条目丢失后 tab 残留、资源无法二次回收。
+
+herdr-live doctor [--kind <k>] [--model <m>]
+herdr-live doctor --live --kind <cursor|claude|codex> [--model <m>]
+    [--timeout-ms <n>] [--cwd <scratch>] [--confirm-start-ms <n>]
+    # advisory 诊断（非 promotion 门禁；与 T09 三 harness 证据格式分离）
+    # 输出 schema_version=doctor-v1：local_preflight 与 live_probe 分栏
+    # 无 --live：只做 PATH/kind/model 预检，零 spawn、零远程/model 调用；
+    #           live_probe.status=not_requested（PATH 成功 ≠ live 成功）
+    # 有 --live：必须精确 kind（model 可走 kinds 默认）→ 孤立探针名 spawn +
+    #           submitPrompt（禁止 raw herdr agent prompt）→ 须同时具备
+    #           lifecycle_observed 与派生 marker（DOCTOR_REV:<token 反转>）
+    #           marker 须出现在与 baseline **同一 capture tail** 的单调后缀中；
+    #           无法证明 baseline 关系时 fail-closed（stale_output_ambiguous）
+    #           公开 JSON 仅含 probe_token_digest / expected_marker_digest（sha256），
+    #           从不输出原始 token/marker；token_in_output 仍为布尔
+    # 有界 timeout；finally 对本探针做 **guarded kill（无 force）**；
+    #           working/blocked/unknown 时 cleanup_guarded，留检、从不 auto-force
+    # 对外 JSON 消毒：省略 prompt body、脱敏 API key/token/password/probe token、截断长 stderr
+    # 失败 error_code（非穷尽）：unsupported_kind|unsupported_model|executable_unavailable|
+    #   ambiguous_transport|timeout|lifecycle_without_token|stale_preexisting_token|
+    #   stale_output_ambiguous|auth_or_api_failure|cleanup_failed|cleanup_guarded|
+    #   live_probe_failed|…；ok=false 时非零退出
+```
+
+## `doctor` 输出 schema（摘要）
+
+```json
+{
+  "schema_version": "doctor-v1",
+  "advisory": true,
+  "ok": true,
+  "mode": "local|live",
+  "error_code": null,
+  "local_preflight": {
+    "ok": true,
+    "herdr_env": true,
+    "herdr_in_path": true,
+    "kind": "cursor",
+    "model": "cursor-grok-4.5-high",
+    "executables": { "cursor": { "command": "cursor-agent", "in_path": true } },
+    "details": []
+  },
+  "live_probe": {
+    "requested": false,
+    "ok": null,
+    "status": "not_requested|pass|fail|skipped",
+    "probe_name": null,
+    "probe_token_digest": null,
+    "expected_marker_digest": null,
+    "token_in_output": false,
+    "lifecycle_observed": false,
+    "transport_phase": null,
+    "cleanup": {
+      "attempted": false,
+      "ok": true,
+      "outcome": "not_needed|closed|already_gone|guarded|failed",
+      "details": { "force": false }
+    }
+  }
+}
+```
+
+Public JSON never includes raw `probe_token` / `expected_marker` (success or failure);
+correlation uses non-reversible `sha256:…` digests. `token_in_output` remains a boolean.
+Cleanup `pending` is internal-only and never appears in a completed result; pre-pane
+failures use `outcome:"not_needed"`.
+
+示例：
+
+```bash
+# 本地预检 only（无远程）
+herdr-live doctor --kind cursor
+
+# 真实 model/API 探针（孤立 tmp cwd；不碰业务 root）
+herdr-live doctor --live --kind cursor --model cursor-grok-4.5-high --timeout-ms 180000
+
+# Verifier 用 scratch 入口（同样不改仓库）
+node test/doctor-live-scratch.js --kind cursor --model cursor-grok-4.5-high
 ```
 
 ## 库 API：`submitPrompt`
@@ -101,7 +183,9 @@ exactly-once acknowledgement，也不证明 Agent 理解或完成任务。
 - `not_sent`：首个 transport 调用尚未开始；调用方可做有界重试。
 - `prompt_filled` / `enter_sent`：transport 已开始；不能据此重发。
 - `lifecycle_observed`：观察到相对 baseline 的新 lifecycle 证据。
-- `ambiguous`：transport 后结果不可证明；必须停止自动重发，由上层关闭旧 Worker 后重派。
+- `ambiguous`：transport 后结果不可证明；必须停止自动重发并隔离旧 Worker。先 `read`
+  和检查实时状态；确认没有更新、安装、迁移、上传等关键操作后再关闭。不能把
+  “关闭旧 Worker”机械地等同于立即 kill。
 - missing/malformed receipt 同样 fail-closed。
 
 Per-target lock 按 Herdr socket/session + pane 串行 wrapper-managed 输入。只有 owner PID 已
@@ -127,7 +211,9 @@ Per-target lock 按 Herdr socket/session + pane 串行 wrapper-managed 输入。
 - **ID 抽取**(`src/herdr.js` deepId):从 `tab create` 的嵌套 JSON 里稳健抠
   `pane_id`/`tab_id`,应对 herdr 版本间结构漂移。
 - **资源清理**:台账(`~/.herdr-live/agents.json`,可用 `HERDR_LIVE_HOME` 覆盖)记录
-  起过的 agent,`kill`/`kill --all` 统一收资源,不用手工记 tab_id。
+  起过的 agent；agent start 失败后也保留可检查的台账。`kill` 默认保护非 idle/done
+  状态，确认安全后才用 `--force`。Codex profile 禁用 `in_app_updates`，升级须在 agent
+  tab 外显式执行，避免关闭 tab 时中断 npm 的 retire→publish 窗口。
 
 ## scene 批量编排(可选)
 
@@ -153,9 +239,11 @@ spawn→prompt→collect。是否中继、如何基于输出决策由 scene 声�
 
 ```
 npm run selftest                      # L0 确定性核:defaultModel、开工确认、brief-file、台账、submitPrompt(pane_id)
+npm run test:doctor                   # L0 doctor：local 零远程、live 分类失败码、cleanup fail-closed
 node test/live-happy-path.js          # L1 单端真 agent:spawn → echo 到文件 → read → kill
+node test/doctor-live-scratch.js --kind cursor   # 真机 doctor --live scratch（可选）
 node test/l2-dual-cursor-brief.js     # L2 双端 cursor:无 --model + --brief-file 并行实测
-                                      # L1/L2 需 HERDR_ENV=1;证据落 logs/l2-dual-cursor-brief/
+                                      # L1/L2/scratch 需 HERDR_ENV=1;证据落 logs/… 或 stdout JSON
 ```
 
 ## 模型 slug 陷阱

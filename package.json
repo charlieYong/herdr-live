@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/live.js",
     "./live": "./src/live.js",
+    "./doctor": "./src/doctor.js",
     "./herdr": "./src/herdr.js",
     "./kinds": "./src/kinds.js",
     "./receipt": "./src/receipt.js",
@@ -18,6 +19,7 @@
   },
   "scripts": {
     "selftest": "node test/selftest.js",
+    "test:doctor": "node test/doctor.js",
     "test:l2": "node test/l2-dual-cursor-brief.js"
   },
   "license": "MIT"

@@ -54,8 +54,9 @@ async function main() {
       console.log(`[happy] PASS：agent 写出了 marker 文件，token 匹配`);
     }
   } finally {
+    // Teardown may run while agent is still working/blocked; explicit force is required.
     console.log('[happy] kill 收资源');
-    try { console.log(JSON.stringify(live.kill(NAME))); } catch (e) { console.error(e.message); }
+    try { console.log(JSON.stringify(live.kill(NAME, { force: true }))); } catch (e) { console.error(e.message); }
     try { fs.rmSync(workdir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
   }
 }

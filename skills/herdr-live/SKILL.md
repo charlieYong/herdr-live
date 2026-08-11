@@ -71,11 +71,19 @@ $HL prompt <name|pane_id> --brief-file <path> | --text <t> | --file <path>
 $HL read <name> [--tail <N>]        # 读 agent 对话输出
 $HL wait <name> [--until <s>[,<s>]] [--timeout-ms <n>]   # 轮询到目标状态(默认 idle,done)
 $HL list                            # 本工具起过的 agents + herdr 实时状态
-$HL kill <name> | --all             # 关 tab 收资源,清台账
+$HL kill <name> | --all [--force]   # 默认仅关 idle/done；其余先检查
+$HL doctor [--kind <k>] [--model <m>]
+$HL doctor --live --kind <cursor|claude|codex> [--model <m>]
+    [--timeout-ms <n>] [--cwd <scratch>]
+    # advisory：local_preflight 与 live_probe 分栏；PATH 成功 ≠ live 成功
+    # 无 --live：零 spawn/远程；有 --live：spawn+submitPrompt 探针，须 lifecycle+派生 marker
+    # marker 须为同窗口 baseline 单调后缀；cleanup=guarded kill（无 force）；JSON 消毒
+    # 只清理本探针名；非 promotion 门禁
 $HL scene <scene.json>              # 声明式批量编排:spawn→prompt→collect
 ```
 
 库调用（voice-agent 叫醒等）：`const { submitPrompt } = require('…/herdr-live/src/live')`，见 README「库 API」。
+Doctor：`const { doctor } = require('…/herdr-live/src/doctor')`。
 
 ## 必须知道的坑(否则会踩)
 
@@ -84,15 +92,25 @@ $HL scene <scene.json>              # 声明式批量编排:spawn→prompt→col
 - **大 prompt 用短指针**:说明书落盘后 `--brief-file`;不要整段 paste 多 KB 进输入框
   （软上限 ~2KB）。`--file` ≠ `--brief-file`。
 - **只按 receipt 相位决策**：已有 working/done/blocked baseline 不证明新 prompt；只接受
-  `lifecycle_observed`。只有 `not_sent` 可重试；`ambiguous` 必须停止投递并由上层关闭旧
-  Worker 后重派。
+  `lifecycle_observed`。只有 `not_sent` 可重试；`ambiguous` 必须停止投递并隔离旧
+  Worker。先 `read` 与检查实时状态，确认没有更新、安装、迁移、上传等关键操作后再关闭；
+  禁止机械地立即 kill。
 - **prompt 提交竞态**：0.7.5 的 settle 是 transport 步骤，不是成功证据；大内容优先
   brief-file，别靠把 `--settle-ms` 调到很大。
 - **合作锁边界**：lock 只串行 wrapper callers，不覆盖人手/raw Herdr 输入；同一 target
   不得混用两种路径。
 - **read 不是权威源**:回滚窗口有限、长输出会滚掉。需要可靠回收产物时,让 agent **写文件**
   (或写到 Bus/外部 transcript),再去读文件,不要单靠 `read` 的终端输出。
+- **安全回收**：`kill` 默认保护 working/blocked/unknown/gone；只有检查 pane 并确认可中断
+  后才用 `--force`。Codex profile 禁用 `in_app_updates`，升级必须在 agent tab 外执行。
 - **model slug**:缺省用 kinds 默认;覆盖前自校验(claude slug ≠ cursor slug)。
+- **doctor 是 advisory**：`doctor` / `doctor --live` 诊断本地预检与 model/API 探针，不是
+  promotion 门禁，也不替代 T09 三 harness 证据格式。无 `--live` 时不得有 spawn/远程调用；
+  live 成功必须同时看到 `lifecycle_observed` 与派生 marker（且 marker 位于与 baseline
+  **同一 capture tail** 的单调后缀；关系无法证明则 `stale_output_ambiguous`）。公开 JSON
+  只暴露 `probe_token_digest` / `expected_marker_digest`（sha256），从不输出原始 token/marker。
+  cleanup 只对本探针做 **guarded kill（无 force）**；working/blocked/unknown 报
+  `cleanup_guarded` 并留检，从不 auto-force。对外 JSON 消毒错误文本（脱敏密钥/prompt body/截断）。
 
 ## 典型场景(何时想起用它)
 
@@ -109,6 +127,8 @@ $HL scene <scene.json>              # 声明式批量编排:spawn→prompt→col
 
 ```bash
 npm run selftest                      # L0
+npm run test:doctor                   # L0 doctor canary 契约
 node test/live-happy-path.js          # L1 单端
+node test/doctor-live-scratch.js --kind cursor   # 可选真机 live probe
 node test/l2-dual-cursor-brief.js     # L2 双 cursor + brief-file
 ```

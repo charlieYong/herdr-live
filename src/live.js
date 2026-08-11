@@ -36,6 +36,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** 投喂后必须在此时间内观察到相对 baseline 的生命周期证据，否则 ambiguous。 */
 const DEFAULT_CONFIRM_START_MS = 10000;
 
+function executableInPath(command) {
+  if (!command || command.includes('/') || command.includes('\\')) return false;
+  const dirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  return dirs.some((dir) => {
+    try {
+      fs.accessSync(path.join(dir, command), fs.constants.X_OK);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  });
+}
+
 /** herdr pane_id 形如 w3:p16 / w3:p3G（workspace:pane）。 */
 function isPaneId(target) {
   return typeof target === 'string' && /^w\d+:p[\w]+$/i.test(target.trim());
@@ -191,6 +204,13 @@ function spawn(name, { kind, model, cwd, label } = {}) {
     throw new herdrMod.HerdrError(e.message || String(e));
   }
   const workdir = cwd || process.cwd();
+  const command = KINDS[kind] && KINDS[kind].command;
+  if (!executableInPath(command)) {
+    throw new herdrMod.HerdrError(
+      `启动前检查失败：kind=${kind} 的可执行文件 ${JSON.stringify(command)} 不在 PATH；` +
+        `未创建 Herdr tab。请先修复安装再重试。`
+    );
+  }
 
   const createArgs = ['tab', 'create', '--cwd', workdir, '--no-focus', '--label', label || `live-${name}`];
   const payload = result(herdrMod.herdr(createArgs, { parseJson: true }));
@@ -199,7 +219,24 @@ function spawn(name, { kind, model, cwd, label } = {}) {
   if (!paneId) throw new herdrMod.HerdrError('无法从 tab create 结果识别 pane_id');
 
   const flags = adapterFlags(kind, { model: resolvedModel, cwd: workdir });
-  herdrMod.herdr(['agent', 'start', name, '--kind', kind, '--pane', paneId, '--', ...flags]);
+  // Register immediately after tab creation. If agent start times out or the
+  // harness launches an installer/updater, the resource remains discoverable
+  // for inspection instead of becoming an untracked orphan.
+  const entry = ledger.put(name, {
+    pane_id: paneId,
+    tab_id: tabId,
+    kind,
+    model: resolvedModel,
+    cwd: workdir,
+  });
+  try {
+    herdrMod.herdr(['agent', 'start', name, '--kind', kind, '--pane', paneId, '--', ...flags]);
+  } catch (e) {
+    throw new herdrMod.HerdrError(
+      `${e.message || e}\nspawn 已创建并登记 ${name}（pane=${paneId}, tab=${tabId}）。` +
+        `先检查 pane 输出；确认无更新、安装、迁移等关键操作后，再用 kill --force 回收。`
+    );
+  }
 
   let state = 'unknown';
   try {
@@ -208,13 +245,6 @@ function spawn(name, { kind, model, cwd, label } = {}) {
     // agent 刚起，list 可能还没收敛——状态留 unknown，不阻断 spawn。
   }
 
-  const entry = ledger.put(name, {
-    pane_id: paneId,
-    tab_id: tabId,
-    kind,
-    model: resolvedModel,
-    cwd: workdir,
-  });
   return { ...entry, state };
 }
 
@@ -531,7 +561,7 @@ function list() {
 // 坑：只有确认关闭成功（或 tab/pane 本就不存在）才从台账删条目。关闭失败时保留
 // 台账条目，让后续 kill --all 能重试回收——否则条目丢了、tab 却残留，资源永久泄漏
 // 且无法二次回收（首版 bug）。
-function kill(name) {
+function kill(name, { force = false } = {}) {
   const entry = ledger.get(name);
   if (!entry) throw new herdrMod.HerdrError(`台账里没有 agent：${name}`);
   const errors = [];
@@ -542,6 +572,28 @@ function kill(name) {
       : null;
   // 无 target（从未拿到 pane/tab id）视为无可关资源，直接清台账。
   let reclaimed = !target;
+  let state = 'unchecked';
+  if (!force) {
+    try {
+      state = herdrMod.agentState(herdrMod.agentRecord(name));
+    } catch (e) {
+      state = 'gone';
+    }
+  }
+  if (target && !force && !['idle', 'done'].includes(state)) {
+    return {
+      name,
+      closed: false,
+      reclaimed: false,
+      guarded: true,
+      state,
+      target,
+      errors: [
+        `安全保护：agent 状态为 ${state}，可能正在更新、安装、迁移或等待交互；` +
+          `请先 read/检查 pane，确认可中断后再用 kill --force。`,
+      ],
+    };
+  }
   if (target) {
     try {
       // 经 herdrMod 调用（而非解构的 herdr）以便自测可注入 stub。
@@ -557,13 +609,13 @@ function kill(name) {
     }
   }
   if (reclaimed) ledger.remove(name);
-  return { name, closed: reclaimed && errors.length === 0, reclaimed, target, errors };
+  return { name, closed: reclaimed && errors.length === 0, reclaimed, guarded: false, state, target, errors };
 }
 
-function killAll() {
+function killAll(opts = {}) {
   return ledger.all().map((entry) => {
     try {
-      return kill(entry.name);
+      return kill(entry.name, opts);
     } catch (e) {
       return { name: entry.name, closed: false, errors: [String(e.message || e)] };
     }
@@ -583,6 +635,7 @@ module.exports = {
   killAll,
   confirmLifecycle,
   assertPasteSize,
+  executableInPath,
   snapshotLifecycle,
   DEFAULT_CONFIRM_START_MS,
   // Hardened: legacy callers must pass a real baseline. A fake idle baseline would

@@ -9,6 +9,7 @@
 
 const KINDS = {
   cursor: {
+    command: 'cursor-agent',
     // 与 herdr-orchestrator/config.toml [agent.cursor].default_model 对齐
     defaultModel: 'cursor-grok-4.5-high',
     // herdr agent start <name> --kind cursor --pane <pid> -- --model <m> --force --trust --add-dir <cwd>
@@ -19,6 +20,7 @@ const KINDS = {
     defaultSettleMs: 1000,
   },
   claude: {
+    command: 'claude',
     defaultModel: 'custom-model-a4',
     // claude 需要 session-id；herdr-live 不管理 session 生命周期，交给 herdr 自行生成时
     // 用 --permission-mode auto 降低权限交互（非 OS 沙箱）。
@@ -28,8 +30,19 @@ const KINDS = {
     defaultSettleMs: 1000,
   },
   codex: {
+    command: 'codex',
     defaultModel: 'custom-model-b5-standard',
-    flags: ['-m', '{model}', '-s', 'workspace-write', '-a', 'on-request', '--add-dir', '{cwd}'],
+    // Orchestrated tabs must not mutate their own executable in-band. A Codex
+    // npm update can retire the live bin symlink before the replacement is
+    // published; closing the tab mid-update then leaves `codex` unavailable.
+    // Keep upgrades as explicit, out-of-band operator actions.
+    flags: [
+      '--disable', 'in_app_updates',
+      '-m', '{model}',
+      '-s', 'workspace-write',
+      '-a', 'on-request',
+      '--add-dir', '{cwd}',
+    ],
     submitNeedsEnter: true,
     // codex 多行填充偶发比 cursor/claude 慢；默认略长，仍建议大 brief 用 --brief-file。
     defaultSettleMs: 2000,

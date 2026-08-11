@@ -75,7 +75,13 @@ check('claude flags 含 permission-mode auto', () => {
 
 check('codex flags 用 -m 与 workspace-write', () => {
   const f = adapterFlags('codex', { model: 'gpt-5-codex', cwd: '/tmp/z' });
-  assert.deepStrictEqual(f, ['-m', 'gpt-5-codex', '-s', 'workspace-write', '-a', 'on-request', '--add-dir', '/tmp/z']);
+  assert.deepStrictEqual(f, [
+    '--disable', 'in_app_updates',
+    '-m', 'gpt-5-codex',
+    '-s', 'workspace-write',
+    '-a', 'on-request',
+    '--add-dir', '/tmp/z',
+  ]);
 });
 
 check('未知 kind 报错', () => {
@@ -144,12 +150,14 @@ check('台账 get 不存在返回 null', () => {
 const herdrMod = require('../src/herdr');
 const live = require('../src/live');
 const realHerdr = herdrMod.herdr;
+const realAgentRecord = herdrMod.agentRecord;
+const realAgentState = herdrMod.agentState;
 
 check('kill 关闭失败时保留台账条目（可重试回收）', () => {
   ledger.put('killFail', { pane_id: 'w1:p9', tab_id: 'w1:t9', kind: 'cursor', model: 'm', cwd: '/c' });
   herdrMod.herdr = () => { throw new herdrMod.HerdrError('transient: server busy'); };
   try {
-    const res = live.kill('killFail');
+    const res = live.kill('killFail', { force: true });
     assert.strictEqual(res.reclaimed, false, 'reclaimed 应为 false');
     assert.strictEqual(res.closed, false, 'closed 应为 false');
     assert.ok(res.errors.length > 0, '应记录错误');
@@ -163,7 +171,7 @@ check('kill 关闭成功时删除台账条目', () => {
   ledger.put('killOk', { pane_id: 'w1:p8', tab_id: 'w1:t8', kind: 'cursor', model: 'm', cwd: '/c' });
   herdrMod.herdr = () => 'ok';
   try {
-    const res = live.kill('killOk');
+    const res = live.kill('killOk', { force: true });
     assert.strictEqual(res.reclaimed, true);
     assert.strictEqual(res.closed, true);
     assert.strictEqual(ledger.get('killOk'), null, '成功后台账条目应删除');
@@ -176,10 +184,132 @@ check('kill tab 已不存在视为已回收并清台账', () => {
   ledger.put('killGone', { pane_id: 'w1:p7', tab_id: 'w1:t7', kind: 'cursor', model: 'm', cwd: '/c' });
   herdrMod.herdr = () => { throw new herdrMod.HerdrError('tab_not_found: w1:t7'); };
   try {
-    const res = live.kill('killGone');
+    const res = live.kill('killGone', { force: true });
     assert.strictEqual(res.reclaimed, true, 'not_found 等价已回收');
     assert.strictEqual(ledger.get('killGone'), null);
   } finally {
+    herdrMod.herdr = realHerdr;
+  }
+});
+
+check('kill 默认保护 working/unknown，显式 force 才关闭', () => {
+  ledger.put('killGuard', { pane_id: 'w1:p6', tab_id: 'w1:t6', kind: 'codex', model: 'm', cwd: '/c' });
+  let closeCalls = 0;
+  herdrMod.agentRecord = () => ({ agent_status: 'working' });
+  herdrMod.agentState = (rec) => rec.agent_status;
+  herdrMod.herdr = () => { closeCalls += 1; return 'ok'; };
+  try {
+    const guarded = live.kill('killGuard');
+    assert.strictEqual(guarded.guarded, true);
+    assert.strictEqual(guarded.closed, false);
+    assert.strictEqual(closeCalls, 0, '保护态不能关闭 tab');
+    assert.ok(ledger.get('killGuard'), '保护态必须保留台账');
+    const forced = live.kill('killGuard', { force: true });
+    assert.strictEqual(forced.closed, true);
+    assert.strictEqual(closeCalls, 1);
+    assert.strictEqual(ledger.get('killGuard'), null);
+  } finally {
+    herdrMod.herdr = realHerdr;
+    herdrMod.agentRecord = realAgentRecord;
+    herdrMod.agentState = realAgentState;
+  }
+});
+
+check('kill 默认允许 idle/done，无需 force', () => {
+  for (const st of ['idle', 'done']) {
+    ledger.put('killAllow', { pane_id: 'w1:p5', tab_id: 'w1:t5', kind: 'cursor', model: 'm', cwd: '/c' });
+    let closeCalls = 0;
+    herdrMod.agentRecord = () => ({ agent_status: st });
+    herdrMod.agentState = (rec) => rec.agent_status;
+    herdrMod.herdr = () => { closeCalls += 1; return 'ok'; };
+    try {
+      const res = live.kill('killAllow');
+      assert.strictEqual(res.guarded, false, `${st} 不应触发保护`);
+      assert.strictEqual(res.closed, true);
+      assert.strictEqual(res.state, st);
+      assert.strictEqual(closeCalls, 1);
+      assert.strictEqual(ledger.get('killAllow'), null);
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+      try { ledger.remove('killAllow'); } catch (e) { /* ignore */ }
+    }
+  }
+});
+
+check('kill 默认保护 blocked/gone', () => {
+  for (const st of ['blocked', 'gone']) {
+    ledger.put('killBlock', { pane_id: 'w1:p4', tab_id: 'w1:t4', kind: 'claude', model: 'm', cwd: '/c' });
+    let closeCalls = 0;
+    if (st === 'gone') {
+      herdrMod.agentRecord = () => { throw new herdrMod.HerdrError('missing'); };
+    } else {
+      herdrMod.agentRecord = () => ({ agent_status: st });
+      herdrMod.agentState = (rec) => rec.agent_status;
+    }
+    herdrMod.herdr = () => { closeCalls += 1; return 'ok'; };
+    try {
+      const res = live.kill('killBlock');
+      assert.strictEqual(res.guarded, true);
+      assert.strictEqual(res.closed, false);
+      assert.strictEqual(res.state, st);
+      assert.strictEqual(closeCalls, 0);
+      assert.ok(ledger.get('killBlock'));
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+      try { ledger.remove('killBlock'); } catch (e) { /* ignore */ }
+    }
+  }
+});
+
+check('spawn 可执行文件预检 helper', () => {
+  assert.strictEqual(live.executableInPath('node'), true);
+  assert.strictEqual(live.executableInPath('definitely-not-a-real-herdr-live-binary'), false);
+});
+
+check('spawn 预检失败不创建 tab', () => {
+  const oldPath = process.env.PATH;
+  let calls = 0;
+  herdrMod.herdr = () => { calls += 1; return {}; };
+  process.env.PATH = '';
+  try {
+    assert.throws(
+      () => live.spawn('spawnPrecheck', { kind: 'cursor', model: 'cursor-grok-4.5-high' }),
+      /启动前检查失败/
+    );
+    assert.strictEqual(calls, 0, '预检失败不得调用 herdr');
+    assert.strictEqual(ledger.get('spawnPrecheck'), null);
+  } finally {
+    process.env.PATH = oldPath;
+    herdrMod.herdr = realHerdr;
+  }
+});
+
+check('spawn agent start 失败时台账已登记', () => {
+  herdrMod.herdr = (args) => {
+    if (args[0] === 'tab' && args[1] === 'create') {
+      return { pane_id: 'w9:p1', tab_id: 'w9:t1' };
+    }
+    if (args[0] === 'agent' && args[1] === 'start') {
+      throw new herdrMod.HerdrError('agent start timeout');
+    }
+    throw new Error(`unexpected herdr args: ${args.join(' ')}`);
+  };
+  try {
+    assert.throws(
+      () => live.spawn('spawnReg', { kind: 'cursor', model: 'cursor-grok-4.5-high' }),
+      /已创建并登记 spawnReg/
+    );
+    const entry = ledger.get('spawnReg');
+    assert.ok(entry, 'start 失败后台账必须可查');
+    assert.strictEqual(entry.pane_id, 'w9:p1');
+    assert.strictEqual(entry.tab_id, 'w9:t1');
+    assert.strictEqual(entry.kind, 'cursor');
+  } finally {
+    try { ledger.remove('spawnReg'); } catch (e) { /* ignore */ }
     herdrMod.herdr = realHerdr;
   }
 });
@@ -190,9 +320,6 @@ check('assertPasteSize：超软上限拒绝', () => {
   assert.doesNotThrow(() => live.assertPasteSize(big, { forcePaste: true }));
   assert.doesNotThrow(() => live.assertPasteSize('ok'));
 });
-
-const realAgentRecord = herdrMod.agentRecord;
-const realAgentState = herdrMod.agentState;
 
 async function checkAsync(name, fn) {
   try {
