@@ -34,7 +34,9 @@ const {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 投喂后必须在此时间内观察到相对 baseline 的生命周期证据，否则 ambiguous。 */
-const DEFAULT_CONFIRM_START_MS = 10000;
+const DEFAULT_CONFIRM_START_MS = 15000;
+/** Workspace Trust 识别只扫 recent-unwrapped 末尾若干行，不并进通用权限 UI。 */
+const WORKSPACE_TRUST_READ_LINES = 80;
 
 function executableInPath(command) {
   if (!command || command.includes('/') || command.includes('\\')) return false;
@@ -152,14 +154,92 @@ function snapshotLifecycle(herdrTarget) {
 const ACTIVE_STATES = new Set(['working', 'done', 'blocked']);
 
 /**
+ * 识别 Cursor Workspace Trust 对话框。这不是权限 UI，不得并进 resolve-attention。
+ * 真实形状：``Workspace Trust Required`` 加 ``[a]`` / ``[q]``。
+ */
+function detectWorkspaceTrustPrompt(terminal) {
+  const text = String(terminal || '');
+  const checks = {
+    banner: /workspace trust required/i.test(text),
+    allow: /\[a\]/i.test(text),
+    quit: /\[q\]/i.test(text),
+  };
+  return {
+    recognized: Boolean(checks.banner && checks.allow && checks.quit),
+    kind: 'cursor-workspace-trust',
+    checks,
+  };
+}
+
+function readRecentTerminal(herdrTarget, lines = WORKSPACE_TRUST_READ_LINES) {
+  try {
+    return String(
+      herdrMod.herdr([
+        'agent',
+        'read',
+        herdrTarget,
+        '--source',
+        'recent-unwrapped',
+        '--lines',
+        String(lines),
+        '--format',
+        'text',
+      ]) || ''
+    );
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * 若 pane 正显示 Workspace Trust，按一次 ``a``。已按过则只报告是否仍在显示。
+ * 读 pane / 按键失败不得抛出——交给调用方继续观察。
+ */
+function tryAllowWorkspaceTrust(herdrTarget, alreadyAccepted) {
+  const detected = detectWorkspaceTrustPrompt(readRecentTerminal(herdrTarget));
+  if (!detected.recognized) {
+    return { showing: false, accepted: Boolean(alreadyAccepted), pressed: false };
+  }
+  if (alreadyAccepted) {
+    return { showing: true, accepted: true, pressed: false };
+  }
+  try {
+    herdrMod.herdr(['agent', 'send-keys', herdrTarget, 'a']);
+    return { showing: true, accepted: true, pressed: true };
+  } catch (e) {
+    return { showing: true, accepted: false, pressed: false };
+  }
+}
+
+async function clearWorkspaceTrust(herdrTarget, { timeoutMs = DEFAULT_CONFIRM_START_MS, pollMs = 100 } = {}) {
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  let accepted = false;
+  let showing = false;
+  do {
+    const trust = tryAllowWorkspaceTrust(herdrTarget, accepted);
+    if (trust.accepted) accepted = true;
+    showing = trust.showing;
+    if (!showing) {
+      return { showing: false, accepted };
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(pollMs);
+  } while (Date.now() < deadline);
+  return { showing, accepted };
+}
+
+/**
  * Confirm lifecycle evidence for *this* submission.
  * An already-working/done/blocked baseline is NOT evidence for the new prompt —
  * require state_change_seq to advance (or a transition into an active state from
  * a non-active baseline).
+ *
+ * Workspace Trust 在观察窗内自动按 ``a``，本身不是开工证据，也不把该屏写成失败。
  */
 async function confirmLifecycle(herdrTarget, baseline, { timeoutMs = DEFAULT_CONFIRM_START_MS, pollMs = 250 } = {}) {
   const deadline = Date.now() + timeoutMs;
   let last = snapshotLifecycle(herdrTarget);
+  let workspaceTrustAccepted = false;
   const baselineActive = ACTIVE_STATES.has(String(baseline && baseline.state));
   const baselineSeq =
     baseline && baseline.state_change_seq != null && Number.isFinite(Number(baseline.state_change_seq))
@@ -178,8 +258,10 @@ async function confirmLifecycle(herdrTarget, baseline, { timeoutMs = DEFAULT_CON
       advanced = baselineSeq == null || seq == null ? true : seq > baselineSeq;
     }
     if (active && advanced) {
-      return { ...last, confirmed: true };
+      return { ...last, confirmed: true, workspace_trust_accepted: workspaceTrustAccepted };
     }
+    const trust = tryAllowWorkspaceTrust(herdrTarget, workspaceTrustAccepted);
+    if (trust.accepted) workspaceTrustAccepted = true;
     await sleep(pollMs);
   }
   const err = new herdrMod.HerdrError(
@@ -188,6 +270,7 @@ async function confirmLifecycle(herdrTarget, baseline, { timeoutMs = DEFAULT_CON
       `已 working 的 baseline 不能当作新 prompt 证据；超时后 receipt=ambiguous，禁止自动重发。`
   );
   err.observed = last;
+  err.workspace_trust_accepted = workspaceTrustAccepted;
   throw err;
 }
 
@@ -238,6 +321,11 @@ function spawn(name, { kind, model, cwd, label } = {}) {
     );
   }
 
+  // 启动刚返回时 Trust 屏可能已在；按一次 a。对话框稍后才出现时由 wait / prompt 接着处理。
+  // spawn 本身不因 idle 或 Trust 失败。
+  const trust = tryAllowWorkspaceTrust(name, false);
+  const workspaceTrustAccepted = Boolean(trust.accepted);
+
   let state = 'unknown';
   try {
     state = herdrMod.agentState(herdrMod.agentRecord(name));
@@ -245,7 +333,7 @@ function spawn(name, { kind, model, cwd, label } = {}) {
     // agent 刚起，list 可能还没收敛——状态留 unknown，不阻断 spawn。
   }
 
-  return { ...entry, state };
+  return { ...entry, state, workspace_trust_accepted: workspaceTrustAccepted };
 }
 
 /**
@@ -437,6 +525,21 @@ async function submitPrompt(opts = {}) {
       }
     }
 
+    // Trust 屏还在时不得填充 prompt。按 a 后仍在显示则 fail not_sent（尚未 transport，可重试）。
+    const trustClear = await clearWorkspaceTrust(herdrTarget, {
+      timeoutMs: confirmStartMs,
+    });
+    if (trustClear.accepted) {
+      receipt.evidence.workspace_trust_accepted = true;
+    }
+    if (trustClear.showing) {
+      return failNotSent(
+        new herdrMod.HerdrError(
+          `Workspace Trust 对话框仍在，未开始 prompt transport（${confirmStartMs}ms）`
+        )
+      );
+    }
+
     receipt.baseline = snapshotLifecycle(herdrTarget);
     receipt.observed = { ...receipt.baseline };
 
@@ -475,6 +578,9 @@ async function submitPrompt(opts = {}) {
         const conf = await confirmLifecycle(herdrTarget, receipt.baseline, {
           timeoutMs: confirmStartMs,
         });
+        if (conf.workspace_trust_accepted) {
+          receipt.evidence.workspace_trust_accepted = true;
+        }
         receiptMod.setPhase(receipt, 'lifecycle_observed', {
           observed: { state: conf.state, state_change_seq: conf.state_change_seq },
         });
@@ -532,12 +638,19 @@ async function wait(name, { until = ['idle', 'done'], timeoutMs = 300000, pollMs
   const targets = (Array.isArray(until) ? until : [until]).map((s) => s.toLowerCase());
   const deadline = Date.now() + timeoutMs;
   let last = 'unknown';
+  let workspaceTrustAccepted = false;
   for (;;) {
     last = currentState(name);
-    if (targets.includes(last)) return { name, state: last, reached: true };
+    const trust = tryAllowWorkspaceTrust(name, workspaceTrustAccepted);
+    if (trust.accepted) workspaceTrustAccepted = true;
+    // Trust 屏通常仍是 idle；不得当成「已起来、可投喂」。
+    if (targets.includes(last) && !trust.showing) {
+      return { name, state: last, reached: true };
+    }
     if (Date.now() >= deadline) {
       throw new herdrMod.HerdrError(
-        `wait 超时（${timeoutMs}ms）：agent ${name} 未到达 [${targets.join(', ')}]，当前 ${last}`
+        `wait 超时（${timeoutMs}ms）：agent ${name} 未到达 [${targets.join(', ')}]，当前 ${last}` +
+          (trust.showing ? '（Workspace Trust 仍在）' : '')
       );
     }
     await sleep(pollMs);
@@ -634,6 +747,7 @@ module.exports = {
   kill,
   killAll,
   confirmLifecycle,
+  detectWorkspaceTrustPrompt,
   assertPasteSize,
   executableInPath,
   snapshotLifecycle,

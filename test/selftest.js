@@ -314,6 +314,85 @@ check('spawn agent start 失败时台账已登记', () => {
   }
 });
 
+const WORKSPACE_TRUST_FIXTURE = `
+Workspace Trust Required
+
+This workspace has not been trusted yet.
+
+  [a] Allow
+  [q] Quit
+`;
+
+const CURSOR_PERMISSION_FIXTURE = `
+Permission required to continue
+❯ a. Allow once
+  A. Always allow
+  d. Deny
+`;
+
+check('detectWorkspaceTrustPrompt 识别 Trust 屏、拒绝权限 UI', () => {
+  assert.strictEqual(live.detectWorkspaceTrustPrompt(WORKSPACE_TRUST_FIXTURE).recognized, true);
+  assert.strictEqual(live.detectWorkspaceTrustPrompt(CURSOR_PERMISSION_FIXTURE).recognized, false);
+  assert.strictEqual(live.detectWorkspaceTrustPrompt('').recognized, false);
+});
+
+check('DEFAULT_CONFIRM_START_MS 为 15000', () => {
+  assert.strictEqual(live.DEFAULT_CONFIRM_START_MS, 15000);
+});
+
+check('spawn 见 Workspace Trust 时按一次 a', () => {
+  const calls = [];
+  herdrMod.herdr = (args) => {
+    calls.push(args);
+    if (args[0] === 'tab' && args[1] === 'create') {
+      return { pane_id: 'w9:p2', tab_id: 'w9:t2' };
+    }
+    if (args[0] === 'agent' && args[1] === 'start') return 'ok';
+    if (args[0] === 'agent' && args[1] === 'read') return WORKSPACE_TRUST_FIXTURE;
+    if (args[0] === 'agent' && args[1] === 'send-keys') return 'ok';
+    throw new Error(`unexpected herdr args: ${args.join(' ')}`);
+  };
+  herdrMod.agentRecord = () => ({ name: 'spawnTrust', agent_status: 'idle', state_change_seq: 1 });
+  herdrMod.agentState = () => 'idle';
+  try {
+    const res = live.spawn('spawnTrust', { kind: 'cursor', model: 'cursor-grok-4.5-high' });
+    assert.strictEqual(res.workspace_trust_accepted, true);
+    assert.ok(calls.some((a) => a[0] === 'agent' && a[1] === 'send-keys' && a[3] === 'a'));
+    assert.ok(!calls.some((a) => a[1] === 'send-keys' && a[3] === 'enter'));
+  } finally {
+    try { ledger.remove('spawnTrust'); } catch (e) { /* ignore */ }
+    herdrMod.herdr = realHerdr;
+    herdrMod.agentRecord = realAgentRecord;
+    herdrMod.agentState = realAgentState;
+  }
+});
+
+check('spawn 权限 UI 不按 a', () => {
+  const calls = [];
+  herdrMod.herdr = (args) => {
+    calls.push(args);
+    if (args[0] === 'tab' && args[1] === 'create') {
+      return { pane_id: 'w9:p3', tab_id: 'w9:t3' };
+    }
+    if (args[0] === 'agent' && args[1] === 'start') return 'ok';
+    if (args[0] === 'agent' && args[1] === 'read') return CURSOR_PERMISSION_FIXTURE;
+    if (args[0] === 'agent' && args[1] === 'send-keys') return 'ok';
+    throw new Error(`unexpected herdr args: ${args.join(' ')}`);
+  };
+  herdrMod.agentRecord = () => ({ name: 'spawnPerm', agent_status: 'idle' });
+  herdrMod.agentState = () => 'idle';
+  try {
+    const res = live.spawn('spawnPerm', { kind: 'cursor', model: 'cursor-grok-4.5-high' });
+    assert.strictEqual(res.workspace_trust_accepted, false);
+    assert.ok(!calls.some((a) => a[1] === 'send-keys'));
+  } finally {
+    try { ledger.remove('spawnPerm'); } catch (e) { /* ignore */ }
+    herdrMod.herdr = realHerdr;
+    herdrMod.agentRecord = realAgentRecord;
+    herdrMod.agentState = realAgentState;
+  }
+});
+
 check('assertPasteSize：超软上限拒绝', () => {
   const big = 'x'.repeat(PASTE_SOFT_LIMIT_BYTES + 1);
   assert.throws(() => live.assertPasteSize(big), /超过输入框软上限/);
@@ -781,6 +860,128 @@ async function checkAsync(name, fn) {
       );
     } finally {
       kinds.KINDS.cursor.submitNeedsEnter = orig;
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('wait：idle+Trust 不视为到达，按一次 a', async () => {
+    herdrMod.agentRecord = () => ({ agent_status: 'idle', state_change_seq: 1 });
+    herdrMod.agentState = () => 'idle';
+    const calls = [];
+    herdrMod.herdr = (args) => {
+      calls.push(args);
+      if (args[1] === 'read') return WORKSPACE_TRUST_FIXTURE;
+      if (args[1] === 'send-keys') return 'ok';
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    try {
+      await assert.rejects(
+        () => live.wait('w1:p70', { until: ['idle'], timeoutMs: 250, pollMs: 50 }),
+        /Workspace Trust 仍在/
+      );
+      const aKeys = calls.filter((a) => a[1] === 'send-keys' && a[3] === 'a');
+      assert.strictEqual(aKeys.length, 1);
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('wait：Trust 消失后 idle 才到达', async () => {
+    herdrMod.agentRecord = () => ({ agent_status: 'idle', state_change_seq: 1 });
+    herdrMod.agentState = () => 'idle';
+    let reads = 0;
+    herdrMod.herdr = (args) => {
+      if (args[1] === 'read') {
+        reads += 1;
+        return reads === 1 ? WORKSPACE_TRUST_FIXTURE : 'prompt ready';
+      }
+      if (args[1] === 'send-keys') return 'ok';
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    try {
+      const res = await live.wait('w1:p71', { until: ['idle'], timeoutMs: 1000, pollMs: 20 });
+      assert.strictEqual(res.reached, true);
+      assert.strictEqual(res.state, 'idle');
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('prompt：Trust 未清除则 not_sent，不调用 agent prompt', async () => {
+    ledger.put('promptTrust', {
+      pane_id: 'w1:p80', tab_id: 'w1:t80', kind: 'cursor', model: 'm', cwd: '/c',
+    });
+    const calls = [];
+    herdrMod.herdr = (args) => {
+      calls.push(args);
+      if (args[1] === 'read') return WORKSPACE_TRUST_FIXTURE;
+      if (args[1] === 'send-keys') return 'ok';
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    herdrMod.agentRecord = () => ({ name: 'promptTrust', agent_status: 'idle', state_change_seq: 1 });
+    herdrMod.agentState = () => 'idle';
+    try {
+      let receipt = null;
+      try {
+        await live.prompt('promptTrust', 'hi', {
+          confirmStartMs: 250,
+          settleMs: 0,
+          skipLock: true,
+          forceProfile: 'official-0.7.5',
+        });
+      } catch (e) {
+        receipt = e.receipt;
+        assert.strictEqual(e.transport_phase, 'not_sent');
+      }
+      assert.ok(receipt);
+      assert.strictEqual(receipt.transport_phase, 'not_sent');
+      assert.strictEqual(receipt.evidence.workspace_trust_accepted, true);
+      assert.ok(!calls.some((a) => a[1] === 'prompt'));
+      assert.ok(calls.some((a) => a[1] === 'send-keys' && a[3] === 'a'));
+    } finally {
+      herdrMod.herdr = realHerdr;
+      herdrMod.agentRecord = realAgentRecord;
+      herdrMod.agentState = realAgentState;
+    }
+  });
+
+  await checkAsync('prompt：Trust 按 a 后见 working → lifecycle_observed', async () => {
+    ledger.put('promptTrustOk', {
+      pane_id: 'w1:p81', tab_id: 'w1:t81', kind: 'cursor', model: 'm', cwd: '/c',
+    });
+    let reads = 0;
+    let seq = 1;
+    herdrMod.herdr = (args) => {
+      if (args[1] === 'read') {
+        reads += 1;
+        return reads === 1 ? WORKSPACE_TRUST_FIXTURE : '';
+      }
+      if (args[1] === 'prompt' || args[1] === 'send-keys') return 'ok';
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    herdrMod.agentRecord = () => {
+      const status = seq === 1 ? 'idle' : 'working';
+      const rec = { name: 'promptTrustOk', agent_status: status, state_change_seq: seq };
+      if (seq === 1) seq = 2;
+      return rec;
+    };
+    herdrMod.agentState = (rec) => (rec && rec.agent_status) || 'idle';
+    try {
+      const res = await live.prompt('promptTrustOk', 'hi', {
+        confirmStartMs: 2000,
+        settleMs: 0,
+        skipLock: true,
+        forceProfile: 'official-0.7.5',
+      });
+      assert.strictEqual(res.transport_phase, 'lifecycle_observed');
+      assert.strictEqual(res.evidence.workspace_trust_accepted, true);
+    } finally {
       herdrMod.herdr = realHerdr;
       herdrMod.agentRecord = realAgentRecord;
       herdrMod.agentState = realAgentState;

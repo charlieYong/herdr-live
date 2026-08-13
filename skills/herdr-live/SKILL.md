@@ -59,17 +59,20 @@ HL="$HOME/charlie/herdr-live/bin/herdr-live.js"
 
 $HL spawn <name> --kind <cursor|claude|codex> [--model <m>] [--cwd <dir>] [--label <l>]
     # --model 可省略（kinds 默认对齐 herdr-orchestrator）
+    # Cursor Workspace Trust 若已出现则按一次 a
 
 $HL prompt <name|pane_id> --brief-file <path> | --text <t> | --file <path>
     [--wait-until <s>[,<s>]] [--timeout-ms <n>] [--settle-ms <n>] [--force-paste]
-    [--submission-id <id>] [--receipt-path <path>] [--persist-receipt]
+    [--confirm-start-ms <n>] [--submission-id <id>] [--receipt-path <path>] [--persist-receipt]
     [--transport-profile official-0.7.5|core-managed-enter] [--kind <kind>]
     # 大内容用 --brief-file（短指针）；--file 仍是整段 paste（≠指针）
+    # 默认确认窗 15s；Trust 未清除则 not_sent（可重试）
     # 成功 receipt.transport_phase=lifecycle_observed；其余非零但保留 receipt
     # ⛔ 禁止用 raw herdr agent prompt 代替（只填充不提交）
 
 $HL read <name> [--tail <N>]        # 读 agent 对话输出
 $HL wait <name> [--until <s>[,<s>]] [--timeout-ms <n>]   # 轮询到目标状态(默认 idle,done)
+    # Trust 仍在时不把 idle 当到达
 $HL list                            # 本工具起过的 agents + herdr 实时状态
 $HL kill <name> | --all [--force]   # 默认仅关 idle/done；其余先检查
 $HL doctor [--kind <k>] [--model <m>]
@@ -94,7 +97,10 @@ Doctor：`const { doctor } = require('…/herdr-live/src/doctor')`。
 - **只按 receipt 相位决策**：已有 working/done/blocked baseline 不证明新 prompt；只接受
   `lifecycle_observed`。只有 `not_sent` 可重试；`ambiguous` 必须停止投递并隔离旧
   Worker。先 `read` 与检查实时状态，确认没有更新、安装、迁移、上传等关键操作后再关闭；
-  禁止机械地立即 kill。
+  禁止机械地立即 kill。默认确认窗 15s。
+- **Workspace Trust**：Cursor `Workspace Trust Required`（`[a]`/`[q]`）在 spawn 后、
+  `wait`、以及 `prompt` 填充前自动按一次 `a`。不是通用权限 UI，不猜其它键。Trust 仍在时
+  `wait` 不把 idle 当到达；尚未 transport 的 `prompt` 记 `not_sent`。
 - **prompt 提交竞态**：0.7.5 的 settle 是 transport 步骤，不是成功证据；大内容优先
   brief-file，别靠把 `--settle-ms` 调到很大。
 - **合作锁边界**：lock 只串行 wrapper callers，不覆盖人手/raw Herdr 输入；同一 target

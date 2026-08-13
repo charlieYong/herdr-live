@@ -58,10 +58,12 @@ const USAGE = `herdr-live — 通用多 agent live 编排
     # target 可为台账名或 pane_id（如 w3:p16；无台账亦可）
     # 官方 0.7.5：prompt→settle→enter；core-managed-enter 禁止二次 Enter
     # 仅 transport_phase=not_sent 可自动重试；post-transport 不确定 → ambiguous
+    # 默认 --confirm-start-ms 15000；Cursor Workspace Trust 在窗内自动按 a
     # 成功/失败均尽量打印 receipt JSON（stdout）；不声称 server 级 queue/write ack
     # 禁止用 raw「herdr agent prompt」当投喂——那只填充输入框、不提交
   herdr-live read <name> [--tail <N>]
   herdr-live wait <name> [--until <state>[,<state>]] [--timeout-ms <n>] [--poll-ms <n>]
+    # Workspace Trust 仍在时不把 idle 当到达，窗内自动按一次 a
   herdr-live list
   herdr-live kill <name> | --all [--force]
     # 默认仅关闭 idle/done；working/blocked/unknown/gone 先保护，检查后才能 --force

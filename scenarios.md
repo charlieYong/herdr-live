@@ -61,7 +61,10 @@
 
 **编排**:`spawn` 后正常 `prompt`;当 agent 进入 blocked(等权限/等输入)或编排者判断需人工时,提示人切到对应 tab(`list` 可查 tab_id)介入,人处理完编排者再 `wait`/继续。
 
-**边界**:herdr-live 不做权限 UI 识别/自动按键(那是 herdr-supervisor 的 resolve-attention 领域);它只负责把 agent 起在人能触达的交互式 pane 里。
+**边界**:herdr-live 不做通用权限 UI 识别/自动按键(那是 herdr-supervisor 的
+`resolve-attention` 领域)。唯一例外：Cursor `Workspace Trust Required` + `[a]`/`[q]`
+在 spawn/`wait`/`prompt` 观察窗内自动按一次 `a`，避免把 idle 确认窗当成失败。其它
+blocked/权限屏仍提示人切到对应 tab 介入。
 
 ---
 

@@ -46,16 +46,18 @@ herdr-live spawn <name> --kind <cursor|claude|codex> [--model <m>] [--cwd <dir>]
     # = tab create(拿 pane_id/tab_id)+ agent start(按 kind 拼对 executor flags)
     # --model 可省略：用 kinds.js 与 herdr-orchestrator 对齐的 defaultModel
     # 创建 tab 前先检查 harness binary；Codex 禁用会话内自更新
-    # 返回 { name, pane_id, tab_id, kind, model, cwd, state }
+    # Cursor Workspace Trust 若已出现则按一次 a；spawn 不因 idle/Trust 失败
+    # 返回 { name, pane_id, tab_id, kind, model, cwd, state, workspace_trust_accepted }
 
 herdr-live prompt <name|pane_id> --text <t> | --file <path> | --brief-file <path>
     [--wait-until <s>[,<s>]] [--timeout-ms <n>] [--settle-ms <n>] [--force-paste]
-    [--submission-id <id>] [--receipt-path <path>] [--persist-receipt]
+    [--confirm-start-ms <n>] [--submission-id <id>] [--receipt-path <path>] [--persist-receipt]
     [--transport-profile official-0.7.5|core-managed-enter] [--kind <kind>]
     # = live.submitPrompt：加锁、按版本执行 transport、输出结构化 receipt
     # target 可为台账名或 pane_id（如 w3:p16；叫醒常有 pane_id、未必在台账）
     # --brief-file：短指针投喂（agent 自己 Read 文件）——大内容首选
     # --file/--text：整段 paste，软上限 ~2KB；超限请改 --brief-file
+    # 默认 --confirm-start-ms 15000；填充前若 Workspace Trust 仍在则 not_sent（可重试）
     # 已 working/done/blocked 的 baseline 不能证明新 prompt；须观察本次之后的状态/序号推进
     # 非 lifecycle_observed 会非零退出，但仍尽量在 stdout/receipt-path 保留 receipt
     # ⛔ 不要用 raw herdr agent prompt 代替本命令（只填充、不提交）
@@ -65,6 +67,7 @@ herdr-live read <name> [--tail <N>]
 
 herdr-live wait <name> [--until <s>[,<s>]] [--timeout-ms <n>] [--poll-ms <n>]
     # 轮询 herdr 实时状态到目标态(默认 idle,done),超时报错
+    # Workspace Trust 仍在时不把 idle 当到达，窗内自动按一次 a
 
 herdr-live list                 # 本工具起过的 live agents + herdr 实时状态
 herdr-live kill <name> | --all [--force]  # 安全回收 tab 与台账
@@ -166,7 +169,7 @@ const receipt = await submitPrompt({
   text: '短指令',             // 或 file / briefFile
   submissionId: 'task-42:executor-a1:ctrl-1',
   settleMs: 1000,             // 可选；默认按 kind
-  confirmStartMs: 10000,
+  confirmStartMs: 15000,
   persistReceipt: true,
 });
 // 成功：receipt.transport_phase === 'lifecycle_observed'
@@ -180,7 +183,7 @@ Receipt 绑定 `submission_id`、prompt SHA-256、exact target、baseline/observ
 Herdr version/profile、相位和时间戳。它是 wrapper transport 的审计事实，不是 server
 exactly-once acknowledgement，也不证明 Agent 理解或完成任务。
 
-- `not_sent`：首个 transport 调用尚未开始；调用方可做有界重试。
+- `not_sent`：首个 transport 调用尚未开始（含 Workspace Trust 未清除）；调用方可做有界重试。
 - `prompt_filled` / `enter_sent`：transport 已开始；不能据此重发。
 - `lifecycle_observed`：观察到相对 baseline 的新 lifecycle 证据。
 - `ambiguous`：transport 后结果不可证明；必须停止自动重发并隔离旧 Worker。先 `read`
@@ -201,6 +204,11 @@ Per-target lock 按 Herdr socket/session + pane 串行 wrapper-managed 输入。
   profile fail-closed。explicit-enter 由 profile 决定，不能被 kind 标志压制。
 - **baseline-aware 开工确认**：提交前记录 state/`state_change_seq`。已有 working/done/
   blocked 不能证明本次投递；只有之后的序号/状态推进才可进入 `lifecycle_observed`。
+  默认观察窗 15s（与 doctor 对齐，可 `--confirm-start-ms` 覆盖）。假 idle 仍不是成功。
+- **Workspace Trust**：Cursor `Workspace Trust Required` + `[a]`/`[q]` 在 spawn 后、
+  `wait` 等到 idle 前、以及 `prompt` 填充前自动按一次 `a`。这不是通用权限 UI，不并进
+  `resolve-attention`。Trust 未清除时 `wait` 不把 idle 当到达；`prompt` 尚未 transport
+  则 `not_sent`（可重试），不得把字填进该对话框。
 - **大 prompt 用短指针**:整段 paste 软上限 ~2KB。长说明书落盘后用 `--brief-file`
   （工具只发「请 Read 此路径」指针）。**决策续跑**用 `--file` 直贴短文，或
   `--brief-file … --brief-style answer`（禁止默认派工腔）。注意：旧 `--file` 是

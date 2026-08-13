@@ -39,14 +39,16 @@ lifecycle，也不代表 Agent 已理解、完成或通过验收。
 herdr-live spawn <name> --kind cursor [--model <m>] --cwd <dir>
     # = tab create(拿 pane_id)+ agent start(按 kind 拼对 adapter flags)
     # --model 可省略:用 kinds.js 与 herdr-orchestrator 对齐的 defaultModel
+    # Cursor Workspace Trust 若已出现则按一次 a；不因 idle 失败
 
 herdr-live prompt <name> --text <t> | --file <path> | --brief-file <path>
     # = exact-target lock + version-aware transport + lifecycle receipt
     # --brief-file:短指针投喂(大内容首选);--file 仍是整段 paste(≠指针)
-    # 只有 lifecycle_observed 成功；not_sent 是唯一可重试相位
+    # 默认确认窗 15s；Trust 未清除则 not_sent；只有 lifecycle_observed 成功
 
 herdr-live read <name> [--tail N]
 herdr-live wait <name> --until <state> [--timeout-ms M]
+    # Trust 仍在时不把 idle 当到达
 herdr-live list
 herdr-live kill <name> | --all
 ```
@@ -58,7 +60,8 @@ herdr-live kill <name> | --all
   core-managed-enter 禁止二次 Enter；unknown fail-closed，不猜测。
 - **receipt + baseline-aware 确认**：记录 exact target、prompt digest、版本、transport phase
   和提交前后 lifecycle。已有 active state 不能确认新 prompt；post-transport 无法证明时
-  记 `ambiguous`，禁止自动重发。仅 pre-transport `not_sent` 可有界重试。
+  记 `ambiguous`，禁止自动重发。仅 pre-transport `not_sent` 可有界重试。默认确认窗 15s。
+  Cursor Workspace Trust 在 spawn/`wait`/`prompt` 观察窗内自动按 `a`（不并进通用权限 UI）。
 - **per-target 合作锁**：按 socket/session + pane 原子串行；仅 owner PID 已消失才回收
   stale lock，`finally` 释放。它不覆盖手工/raw 输入。
 - **大内容短指针**:整段 paste 软上限 ~2KB;长说明书用 `--brief-file`(agent 自己 Read)。

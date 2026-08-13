@@ -8,13 +8,13 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const live = require('./live');
 const { KINDS, resolveModel } = require('./kinds');
 const ledger = require('./ledger');
-const live = require('./live');
 
 const SCHEMA_VERSION = 'doctor-v1';
 const DEFAULT_LIVE_TIMEOUT_MS = 120000;
-const DEFAULT_CONFIRM_START_MS = 15000;
+const DEFAULT_CONFIRM_START_MS = live.DEFAULT_CONFIRM_START_MS;
 /** Same tail window for baseline and post-read — unequal windows are forbidden. */
 const OUTPUT_CAPTURE_TAIL = 200;
 const SANITIZE_MAX_LEN = 400;
